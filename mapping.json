@@ -1,0 +1,14 @@
+{
+  "serial": {
+    "port": "COM1",
+    "baud": 115200,
+    "timeout": 50
+  },
+  "value_max": 1024.0,
+  "work_device_1": "None",
+  "work_device_2": "None",
+  "debug_mode": false,
+  "use_logarithmic_scale": false,
+  "enable_osd": true,
+  "dials": []
+}
