@@ -1244,6 +1244,8 @@ fn token_to_vk(token: &str) -> Option<(u16, bool)> {
         "f5" => 0x74, "f6" => 0x75, "f7" => 0x76, "f8" => 0x77,
         "f9" => 0x78, "f10" => 0x79, "f11" => 0x7A, "f12" => 0x7B,
         "f13" => 0x7C, "f14" => 0x7D, "f15" => 0x7E, "f16" => 0x7F,
+        "f17" => 0x80, "f18" => 0x81, "f19" => 0x82, "f20" => 0x83,
+        "f21" => 0x84, "f22" => 0x85, "f23" => 0x86, "f24" => 0x87,
 
         "-" | "minus" => 0xBD, "=" | "plus" | "equals" => 0xBB,
         "[" => 0xDB, "]" => 0xDD, "\\" | "backslash" => 0xDC,
@@ -2392,6 +2394,14 @@ const MEDIA_LABELS: [&str; 7] = [
     "Play/Pause", "Next Track", "Prev Track", "Stop", "Volume Up", "Volume Down", "Volume Mute",
 ];
 const MEDIA_TOKENS: [&str; 7] = ["play_pause", "next", "prev", "stop", "vol_up", "vol_down", "vol_mute"];
+const F_KEY_LABELS: [&str; 24] = [
+    "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
+    "F13", "F14", "F15", "F16", "F17", "F18", "F19", "F20", "F21", "F22", "F23", "F24",
+];
+const F_KEY_TOKENS: [&str; 24] = [
+    "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12",
+    "f13", "f14", "f15", "f16", "f17", "f18", "f19", "f20", "f21", "f22", "f23", "f24",
+];
 
 fn egui_key_to_token(key: egui::Key) -> Option<&'static str> {
     use egui::Key::*;
@@ -2404,6 +2414,9 @@ fn egui_key_to_token(key: egui::Key) -> Option<&'static str> {
         Num5 => "5", Num6 => "6", Num7 => "7", Num8 => "8", Num9 => "9",
         F1 => "f1", F2 => "f2", F3 => "f3", F4 => "f4", F5 => "f5", F6 => "f6",
         F7 => "f7", F8 => "f8", F9 => "f9", F10 => "f10", F11 => "f11", F12 => "f12",
+        F13 => "f13", F14 => "f14", F15 => "f15", F16 => "f16", F17 => "f17",
+        F18 => "f18", F19 => "f19", F20 => "f20", F21 => "f21", F22 => "f22",
+        F23 => "f23", F24 => "f24",
         Space => "space", Tab => "tab", Backspace => "backspace", Delete => "delete",
         Enter => "enter", Escape => "esc",
         Insert => "insert", Home => "home", End => "end", PageUp => "pageup",
@@ -3615,6 +3628,16 @@ impl RvciApp {
                                     }
                                     "keys" => {
                                         let capturing = self.key_capture == Some(i);
+                                        let preset_label = if self.cfg.buttons[i].modifiers.is_empty() {
+                                            let key = self.cfg.buttons[i].key_combo.to_ascii_lowercase();
+                                            F_KEY_LABELS
+                                                .iter()
+                                                .zip(F_KEY_TOKENS)
+                                                .find_map(|(label, token)| (key == token).then_some(*label))
+                                                .unwrap_or("F keys")
+                                        } else {
+                                            "F keys"
+                                        };
                                         let label = if capturing {
                                             "Press keys".to_string()
                                         } else {
@@ -3628,16 +3651,30 @@ impl RvciApp {
                                         } else {
                                             (widget_bg(), row_hover())
                                         };
-                                        if filled_button(ui, &label, base, hover, egui::vec2(mid_w, 30.0))
-                                            .clicked()
-                                        {
-                                            if capturing {
-                                                self.key_capture = None;
-                                            } else {
-                                                self.key_capture = Some(i);
-                                                self.key_capture_since = Instant::now();
+                                        ui.horizontal(|ui| {
+                                            let width = (mid_w * 0.36).max(90.0);
+                                            if let Some(pick) = select(
+                                                ui,
+                                                ("bkeypreset", i),
+                                                preset_label,
+                                                width,
+                                                SelectStyle::Inline,
+                                                &F_KEY_LABELS,
+                                            ) {
+                                                self.cfg.buttons[i].modifiers.clear();
+                                                self.cfg.buttons[i].key_combo = F_KEY_TOKENS[pick].to_string();
                                             }
-                                        }
+                                            if filled_button(ui, &label, base, hover, egui::vec2(mid_w - width - 8.0, 30.0))
+                                                .clicked()
+                                            {
+                                                if capturing {
+                                                    self.key_capture = None;
+                                                } else {
+                                                    self.key_capture = Some(i);
+                                                    self.key_capture_since = Instant::now();
+                                                }
+                                            }
+                                        });
                                     }
                                     _ => {
                                         quiet_note(ui, "Nothing bound", mid_w);
@@ -6179,6 +6216,13 @@ mod tests {
         assert!(b.key_combo.is_empty());
         assert_eq!(b.media_key, MEDIA_TOKENS[0]);
         assert_eq!(b.dial_index, 1, "dial_index must be clamped into range");
+    }
+
+    #[test]
+    fn extra_function_keys_are_supported() {
+        assert_eq!(token_to_vk("f13"), Some((0x7C, false)));
+        assert_eq!(token_to_vk("f17"), Some((0x80, false)));
+        assert_eq!(token_to_vk("f24"), Some((0x87, false)));
     }
 
     #[test]
