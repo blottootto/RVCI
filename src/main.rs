@@ -2658,8 +2658,11 @@ fn run_serial_processing(
     }
 }
 
-fn load_icon_image(path: &Path) -> Option<image::RgbaImage> {
-    let mut reader = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?;
+fn load_icon_image() -> Option<image::RgbaImage> {
+    let mut reader = image::ImageReader::with_format(
+        std::io::Cursor::new(RVCI_ICO),
+        image::ImageFormat::Ico,
+    );
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(1024);
     limits.max_image_height = Some(1024);
@@ -2668,8 +2671,8 @@ fn load_icon_image(path: &Path) -> Option<image::RgbaImage> {
     Some(reader.decode().ok()?.into_rgba8())
 }
 
-fn load_tray_icon(filename: &str) -> Icon {
-    if let Some(rgba) = load_icon_image(&get_exe_dir().join(filename)) {
+fn load_tray_icon() -> Icon {
+    if let Some(rgba) = load_icon_image() {
         let (w, h) = rgba.dimensions();
         if let Ok(icon) = Icon::from_rgba(rgba.into_raw(), w, h) { return icon; }
     }
@@ -2679,8 +2682,8 @@ fn load_tray_icon(filename: &str) -> Icon {
     Icon::from_rgba(rgba, width, height).unwrap_or_else(|_| panic!("Icon error"))
 }
 
-fn load_window_icon(filename: &str) -> Option<egui::IconData> {
-    let rgba = load_icon_image(&get_exe_dir().join(filename))?;
+fn load_window_icon() -> Option<egui::IconData> {
+    let rgba = load_icon_image()?;
     let (w, h) = rgba.dimensions();
     Some(egui::IconData { rgba: rgba.into_raw(), width: w, height: h })
 }
@@ -3030,6 +3033,7 @@ const BAUD_RATES: [u32; 5] = [9600, 19200, 38400, 57600, 115200];
 
 const GITHUB_URL: &str = "https://github.com/blottootto/RVCI";
 const GITHUB_PNG: &[u8] = include_bytes!("../assets/github.png");
+const RVCI_ICO: &[u8] = include_bytes!("../rvci.ico");
 
 struct RvciApp {
     config_path: PathBuf,
@@ -3098,7 +3102,7 @@ impl RvciApp {
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(tray_menu))
             .with_tooltip("RVCI")
-            .with_icon(load_tray_icon("rvci.ico"))
+            .with_icon(load_tray_icon())
             .build()
             .ok();
         if tray.is_none() {
@@ -6447,7 +6451,7 @@ fn main() -> Result<()> {
         .with_min_inner_size([620.0, 540.0])
         .with_position([-32000.0, -32000.0])
         .with_visible(true);
-    if let Some(icon) = load_window_icon("rvci.ico") {
+    if let Some(icon) = load_window_icon() {
         viewport = viewport.with_icon(Arc::new(icon));
     }
 
@@ -7045,6 +7049,13 @@ mod tests {
         let mut otto = b"OTTO".to_vec();
         otto.extend(std::iter::repeat(0u8).take(8192));
         assert!(is_sfnt(&otto));
+    }
+
+    #[test]
+    fn embedded_application_icon_can_be_decoded() {
+        let icon = load_icon_image().expect("embedded rvci.ico should decode");
+        assert!(icon.width() > 0);
+        assert!(icon.height() > 0);
     }
 
     #[test]
