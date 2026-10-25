@@ -825,6 +825,9 @@ struct ButtonConfig {
 
     #[serde(default = "default_true")]
     output_2: bool,
+
+    #[serde(default)]
+    output_enabled: Vec<bool>,
 }
 
 impl Default for ButtonConfig {
@@ -838,6 +841,7 @@ impl Default for ButtonConfig {
             output_process: "None".to_string(),
             output_1: true,
             output_2: true,
+            output_enabled: Vec::new(),
         }
     }
 }
@@ -846,8 +850,12 @@ impl Default for ButtonConfig {
 struct AppConfig {
     serial: SerialConfig,
     value_max: f32,
+    #[serde(default = "default_string_none")]
     work_device_1: String,
+    #[serde(default = "default_string_none")]
     work_device_2: String,
+    #[serde(default)]
+    work_devices: Vec<String>,
     #[serde(default)]
     debug_mode: bool,
     #[serde(default)]
@@ -977,6 +985,7 @@ impl Default for AppConfig {
             value_max: 720.0,
             work_device_1: "None".to_string(),
             work_device_2: "None".to_string(),
+            work_devices: vec!["None".to_string(), "None".to_string()],
             debug_mode: false,
             use_logarithmic_scale: false,
             enable_osd: true,
@@ -1013,6 +1022,7 @@ const MAX_DIALS: usize = 32;
 const MAX_BUTTONS: usize = 32;
 const MAX_NAME_CHARS: usize = 128;
 const MAX_PROCESS_SELECTION_CHARS: usize = 2048;
+const MAX_OUTPUT_DEVICES: usize = 16;
 const DEFAULT_VALUE_MAX: f32 = 1024.0;
 const MAX_VALUE_MAX: f32 = 65535.0;
 
@@ -1044,6 +1054,33 @@ fn process_selection_names(value: Option<&str>) -> Vec<String> {
         .collect()
 }
 
+fn button_output_enabled(button: &ButtonConfig, index: usize) -> bool {
+    button.output_enabled.get(index).copied().unwrap_or(match index {
+        0 => button.output_1,
+        1 => button.output_2,
+        _ => true,
+    })
+}
+
+fn remove_configured_output(config: &mut AppConfig, index: usize) -> bool {
+    if index >= config.work_devices.len() || config.work_devices.len() <= 2 {
+        return false;
+    }
+    config.work_devices.remove(index);
+    for button in &mut config.buttons {
+        if button.output_enabled.is_empty() {
+            button.output_enabled = vec![button.output_1, button.output_2];
+        }
+        if index < button.output_enabled.len() {
+            button.output_enabled.remove(index);
+        }
+        button.output_enabled.resize(config.work_devices.len(), true);
+        button.output_1 = button.output_enabled[0];
+        button.output_2 = button.output_enabled[1];
+    }
+    true
+}
+
 fn process_selection_display(value: &str) -> Option<String> {
     let names = process_selection_names(Some(value));
     if names.iter().any(|name| name.eq_ignore_ascii_case("All")) {
@@ -1063,6 +1100,10 @@ fn output_osd_label(selection: &str, device: &str) -> String {
     format!("{process_label} -> {device}")
 }
 
+fn osd_label_width(label: &str) -> f32 {
+    (label.chars().count() as f32 * 8.0 + 80.0).clamp(308.0, 760.0)
+}
+
 fn sanitize_config(cfg: &mut AppConfig) {
     if !cfg.value_max.is_finite() || cfg.value_max < 1.0 {
         cfg.value_max = DEFAULT_VALUE_MAX;
@@ -1074,8 +1115,18 @@ fn sanitize_config(cfg: &mut AppConfig) {
     }
     cfg.serial.timeout = cfg.serial.timeout.clamp(1, 5000);
     clip_chars(&mut cfg.serial.port, MAX_NAME_CHARS);
-    clip_chars(&mut cfg.work_device_1, MAX_NAME_CHARS);
-    clip_chars(&mut cfg.work_device_2, MAX_NAME_CHARS);
+    if cfg.work_devices.is_empty() {
+        cfg.work_devices = vec![cfg.work_device_1.clone(), cfg.work_device_2.clone()];
+    }
+    cfg.work_devices.truncate(MAX_OUTPUT_DEVICES);
+    while cfg.work_devices.len() < 2 {
+        cfg.work_devices.push("None".to_string());
+    }
+    for device in &mut cfg.work_devices {
+        clip_chars(device, MAX_NAME_CHARS);
+    }
+    cfg.work_device_1 = cfg.work_devices[0].clone();
+    cfg.work_device_2 = cfg.work_devices[1].clone();
     clip_chars(&mut cfg.theme, MAX_NAME_CHARS);
     if !OSD_STYLES.contains(&cfg.osd_style.as_str()) {
         cfg.osd_style = default_osd_style();
@@ -1115,10 +1166,16 @@ fn sanitize_config(cfg: &mut AppConfig) {
         if b.output_process.is_empty() {
             b.output_process = "None".to_string();
         }
-        if !(b.output_1 || b.output_2) {
-            b.output_1 = true;
-            b.output_2 = true;
+        if b.output_enabled.is_empty() {
+            b.output_enabled = vec![b.output_1, b.output_2];
         }
+        b.output_enabled.truncate(cfg.work_devices.len());
+        b.output_enabled.resize(cfg.work_devices.len(), true);
+        if !b.output_enabled.iter().any(|enabled| *enabled) {
+            b.output_enabled.fill(true);
+        }
+        b.output_1 = b.output_enabled[0];
+        b.output_2 = b.output_enabled[1];
     }
 }
 
@@ -1330,13 +1387,14 @@ fn next_process_output(
         return None;
     }
 
-    let valid: Vec<usize> = [0usize, 1usize]
-        .into_iter()
-        .filter(|idx| match idx {
-            0 => button.output_1 && !config.work_device_1.is_empty() && config.work_device_1 != "None",
-            1 => button.output_2 && !config.work_device_2.is_empty() && config.work_device_2 != "None",
-            _ => false,
+    let valid: Vec<usize> = config
+        .work_devices
+        .iter()
+        .enumerate()
+        .filter(|(index, device)| {
+            button_output_enabled(button, *index) && !device.is_empty() && device.as_str() != "None"
         })
+        .map(|(index, _)| index)
         .collect();
 
     if valid.is_empty() {
@@ -1353,11 +1411,7 @@ fn next_process_output(
         valid[0]
     };
 
-    let target = match next {
-        0 => config.work_device_1.clone(),
-        1 => config.work_device_2.clone(),
-        _ => return None,
-    };
+    let target = config.work_devices.get(next)?.clone();
     if target.is_empty() || target == "None" {
         return None;
     }
@@ -1909,8 +1963,7 @@ fn serial_settings_changed(a: &AppConfig, b: &AppConfig) -> bool {
         || a.value_max != b.value_max
         || a.use_logarithmic_scale != b.use_logarithmic_scale
         || a.enable_osd != b.enable_osd
-        || a.work_device_1 != b.work_device_1
-        || a.work_device_2 != b.work_device_2
+        || a.work_devices != b.work_devices
         || a.dials != b.dials
         || a.buttons != b.buttons
 }
@@ -2326,7 +2379,8 @@ fn run_serial_processing(
         //log_info!("DEBUG SERIAL INPUT: {}", line);
 
         if line == "WORKS 1" || line == "WORKS 2" {
-            let target = if line == "WORKS 1" { &config.work_device_1 } else { &config.work_device_2 };
+            let output_index = if line == "WORKS 1" { 0 } else { 1 };
+            let target = config.work_devices.get(output_index).map(String::as_str).unwrap_or("None");
             log_info!("input: {line} switch, moving the default output to {target}");
             let landed = switch_device(target);
             if config.enable_osd {
@@ -3209,8 +3263,9 @@ impl RvciApp {
     fn save(&mut self) {
         let _ = set_startup_launch(self.startup_enabled);
 
-        self.cfg.work_device_1 = extract_clean_name(&self.cfg.work_device_1);
-        self.cfg.work_device_2 = extract_clean_name(&self.cfg.work_device_2);
+        for device in &mut self.cfg.work_devices {
+            *device = extract_clean_name(device);
+        }
         sanitize_config(&mut self.cfg);
 
         if self.config_unreadable {
@@ -3694,19 +3749,22 @@ impl RvciApp {
         let mut options: Vec<String> = vec!["None".to_string()];
         options.extend(devices.iter().cloned());
 
-        section(ui, "Output switcher", |ui| {
+        let (add_clicked, _) = section_with_action(ui, "Output switcher", "Add output", |ui| {
             let mut rows = Rows::new();
-            for (n, label) in [(1u8, "Output 1"), (2u8, "Output 2")] {
+            let mut remove = None;
+            for n in 0..self.cfg.work_devices.len() {
                 rows.item(ui, |ui| {
                     ui.horizontal(|ui| {
-                        label_cell(ui, label);
-                        let stored = if n == 1 {
-                            self.cfg.work_device_1.clone()
-                        } else {
-                            self.cfg.work_device_2.clone()
-                        };
+                        label_cell(ui, &format!("Output {}", n + 1));
+                        let stored = self.cfg.work_devices[n].clone();
                         let display = routing_display(&stored, &devices);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if n >= 2 && delete_button(ui).clicked() {
+                                remove = Some(n);
+                            }
+                            if n >= 2 {
+                                ui.add_space(5.0);
+                            }
                             if text_button(ui, "Test")
                                 .on_hover_text("Switch to this output now")
                                 .clicked()
@@ -3731,18 +3789,20 @@ impl RvciApp {
                                 SelectStyle::Row,
                                 &options,
                             ) {
-                                let picked = options[i].clone();
-                                if n == 1 {
-                                    self.cfg.work_device_1 = picked;
-                                } else {
-                                    self.cfg.work_device_2 = picked;
-                                }
+                                self.cfg.work_devices[n] = options[i].clone();
                             }
                         });
                     });
                 });
             }
+            if let Some(index) = remove {
+                remove_configured_output(&mut self.cfg, index);
+            }
         });
+
+        if add_clicked && self.cfg.work_devices.len() < MAX_OUTPUT_DEVICES {
+            self.cfg.work_devices.push("None".to_string());
+        }
     }
 
     fn section_knobs(&mut self, ui: &mut egui::Ui) {
@@ -4005,14 +4065,26 @@ impl RvciApp {
                                                 self.cfg.buttons[i].output_process = selection;
                                             }
                                             ui.horizontal(|ui| {
-                                                let mut out1 = self.cfg.buttons[i].output_1;
-                                                let mut out2 = self.cfg.buttons[i].output_2;
-                                                if ui.checkbox(&mut out1, "Output 1").changed() {
-                                                    self.cfg.buttons[i].output_1 = out1;
-                                                }
-                                                if ui.checkbox(&mut out2, "Output 2").changed() {
-                                                    self.cfg.buttons[i].output_2 = out2;
-                                                }
+                                                let output_count = self.cfg.work_devices.len();
+                                                self.cfg.buttons[i]
+                                                    .output_enabled
+                                                    .resize(output_count, true);
+                                                ui.horizontal_wrapped(|ui| {
+                                                    for output_index in 0..output_count {
+                                                        let mut enabled = self.cfg.buttons[i].output_enabled[output_index];
+                                                        if ui
+                                                            .checkbox(&mut enabled, format!("Output {}", output_index + 1))
+                                                            .changed()
+                                                        {
+                                                            self.cfg.buttons[i].output_enabled[output_index] = enabled;
+                                                            if output_index == 0 {
+                                                                self.cfg.buttons[i].output_1 = enabled;
+                                                            } else if output_index == 1 {
+                                                                self.cfg.buttons[i].output_2 = enabled;
+                                                            }
+                                                        }
+                                                    }
+                                                });
                                             });
                                         });
                                     }
@@ -5865,6 +5937,7 @@ mod osd {
         log_info!("osd: overlay window created");
 
         let mut scale = 0.0f32;
+        let mut canvas_width = 0.0f32;
         let mut canvas: Option<Canvas> = None;
         let mut fonts: Option<Fonts> = None;
 
@@ -5930,25 +6003,30 @@ mod osd {
                 holding = true;
 
                 let spot = (super::osd_position(), super::osd_monitor());
-                if fresh || spot != target_spot {
+                let wanted_width = super::osd_label_width(&label);
+                if fresh || spot != target_spot || (wanted_width - canvas_width).abs() > 0.5 {
                     target_spot = spot;
                     visible = true;
                     pending_show = pending_show || fresh;
-                    let (dpi, note) = place_window(hwnd);
+                    let (dpi, note) = place_window(hwnd, wanted_width);
                     if note != placed {
                         log_debug!("osd: placed {note}");
                         placed = note;
                     }
                     let want = (dpi as f32 / 96.0).clamp(1.0, 4.0);
-                    if canvas.is_none() || (want - scale).abs() > 0.01 {
+                    if canvas.is_none()
+                        || (want - scale).abs() > 0.01
+                        || (wanted_width - canvas_width).abs() > 0.5
+                    {
                         scale = want;
+                        canvas_width = wanted_width;
                         if let Some(c) = canvas.take() {
                             c.destroy();
                         }
                         if let Some(f) = fonts.take() {
                             f.destroy();
                         }
-                        let w = (BASE_W * scale).round() as i32;
+                        let w = (canvas_width * scale).round() as i32;
                         let h = (BASE_H * scale).round() as i32;
                         canvas = Canvas::new(w, h, scale);
                         fonts = Some(Fonts::new(scale));
@@ -6042,7 +6120,7 @@ mod osd {
         }
     }
 
-    unsafe fn place_window(hwnd: HWND) -> (u32, String) {
+    unsafe fn place_window(hwnd: HWND, width: f32) -> (u32, String) {
         let monitors = super::list_monitors();
         let wanted = super::osd_monitor();
         let picked = super::pick_monitor(&monitors, &wanted);
@@ -6055,7 +6133,7 @@ mod osd {
         };
 
         let scale = (dpi as f32 / 96.0).clamp(1.0, 4.0);
-        let w = (BASE_W * scale).round() as i32;
+        let w = (width * scale).round() as i32;
         let h = (BASE_H * scale).round() as i32;
         let margin = (BASE_MARGIN * scale).round() as i32;
 
@@ -6563,7 +6641,50 @@ mod tests {
         assert_eq!(osd_label(&none), None);
         assert_eq!(osd_label(&empty), None);
         assert_eq!(osd_label(&app).as_deref(), Some("Spotify"));
-        assert_eq!(osd_label(&multi).as_deref(), Some("Firefox"));
+        assert_eq!(osd_label(&multi).as_deref(), Some("Firefox, Plexamp"));
+    }
+
+    #[test]
+    fn process_selection_parsing_trims_and_deduplicates_names() {
+        assert_eq!(
+            process_selection_names(Some(" Firefox.exe, Plexamp, firefox.exe, None, ")),
+            vec!["Firefox.exe", "Plexamp"]
+        );
+    }
+
+    #[test]
+    fn output_osd_label_includes_all_selected_processes() {
+        assert_eq!(
+            output_osd_label("Firefox, Plexamp", "Headphones"),
+            "Firefox, Plexamp -> Headphones"
+        );
+        assert_eq!(
+            output_osd_label("All", "Headphones"),
+            "All processes -> Headphones"
+        );
+        assert_eq!(osd_label_width("Firefox"), 308.0);
+        assert!(osd_label_width("Firefox, Plexamp, Discord, Spotify") > 308.0);
+        assert_eq!(osd_label_width(&"P".repeat(200)), 760.0);
+    }
+
+    #[test]
+    fn multiple_process_selections_round_trip_in_existing_config_fields() {
+        let mut config = AppConfig::default();
+        config.dials.push(DialConfig {
+            dial_type: "process".into(),
+            process_name: Some("Firefox, Plexamp".into()),
+            inverted: false,
+        });
+        config.buttons.push(ButtonConfig {
+            action: "output".into(),
+            output_process: "Firefox, Plexamp".into(),
+            ..ButtonConfig::default()
+        });
+
+        let json = serde_json::to_vec(&config).unwrap();
+        let loaded: AppConfig = serde_json::from_slice(&json).unwrap();
+        assert_eq!(loaded.dials[0].process_name.as_deref(), Some("Firefox, Plexamp"));
+        assert_eq!(loaded.buttons[0].output_process, "Firefox, Plexamp");
     }
 
     #[test]
@@ -6626,6 +6747,7 @@ mod tests {
             output_process: "None".into(),
             output_1: true,
             output_2: true,
+            output_enabled: vec![],
         }]);
         sanitize_config(&mut cfg);
         let b = &cfg.buttons[0];
@@ -6645,8 +6767,7 @@ mod tests {
     #[test]
     fn process_output_selection_alternates_without_committing_early() {
         let mut config = AppConfig::default();
-        config.work_device_1 = "Headphones".into();
-        config.work_device_2 = "Monitor".into();
+        config.work_devices = vec!["Headphones".into(), "Monitor".into()];
         let button = ButtonConfig::default();
         let mut state = HashMap::new();
 
@@ -6662,11 +6783,11 @@ mod tests {
     #[test]
     fn process_output_selection_uses_the_only_checked_output() {
         let mut config = AppConfig::default();
-        config.work_device_1 = "Headphones".into();
-        config.work_device_2 = "Monitor".into();
+        config.work_devices = vec!["Headphones".into(), "Monitor".into()];
         let button = ButtonConfig {
             output_1: true,
             output_2: false,
+            output_enabled: vec![true, false],
             ..ButtonConfig::default()
         };
         let mut state = HashMap::new();
@@ -6681,8 +6802,7 @@ mod tests {
     #[test]
     fn all_output_selection_cycles_between_configured_devices() {
         let mut config = AppConfig::default();
-        config.work_device_1 = "Headphones".into();
-        config.work_device_2 = "Monitor".into();
+        config.work_devices = vec!["Headphones".into(), "Monitor".into()];
         let button = ButtonConfig::default();
         let state = HashMap::new();
 
@@ -6695,16 +6815,87 @@ mod tests {
     #[test]
     fn process_output_selection_rejects_missing_targets() {
         let mut config = AppConfig::default();
-        config.work_device_1 = "Headphones".into();
+        config.work_devices = vec!["Headphones".into(), "Monitor".into()];
         let button = ButtonConfig {
             output_1: false,
             output_2: false,
+            output_enabled: vec![false, false],
             ..ButtonConfig::default()
         };
         let state = HashMap::new();
 
         assert_eq!(next_process_output("Plexamp", &button, &config, &state), None);
         assert_eq!(next_process_output("None", &button, &config, &state), None);
+    }
+
+    #[test]
+    fn process_output_selection_cycles_all_enabled_configured_devices() {
+        let config = AppConfig {
+            work_devices: vec!["A".into(), "B".into(), "C".into(), "D".into()],
+            ..AppConfig::default()
+        };
+        let button = ButtonConfig {
+            output_enabled: vec![true, false, true, true],
+            ..ButtonConfig::default()
+        };
+        let mut state = HashMap::new();
+
+        let first = next_process_output("Plexamp", &button, &config, &state).unwrap();
+        assert_eq!(first, (2, "C".into()), "disabled output B is skipped");
+        state.insert("Plexamp".into(), first.0);
+        let second = next_process_output("Plexamp", &button, &config, &state).unwrap();
+        assert_eq!(second, (3, "D".into()));
+        state.insert("Plexamp".into(), second.0);
+        let third = next_process_output("Plexamp", &button, &config, &state).unwrap();
+        assert_eq!(third, (0, "A".into()), "the cycle wraps to the first enabled output");
+    }
+
+    #[test]
+    fn legacy_two_output_config_migrates_into_the_device_list() {
+        let mut config = AppConfig::default();
+        config.work_devices.clear();
+        config.work_device_1 = "Speakers".into();
+        config.work_device_2 = "Headphones".into();
+        config.buttons.push(ButtonConfig {
+            output_1: true,
+            output_2: false,
+            ..ButtonConfig::default()
+        });
+
+        sanitize_config(&mut config);
+        assert_eq!(config.work_devices, vec!["Speakers", "Headphones"]);
+        assert_eq!(config.buttons[0].output_enabled, vec![true, false]);
+    }
+
+    #[test]
+    fn list_only_output_config_loads_without_legacy_fields() {
+        let json = br#"{"serial":{"port":"COM3","baud":115200,"timeout":50},
+            "value_max":1024.0,"work_devices":["A","B","C"],"dials":[]}"#;
+        let mut config: AppConfig = serde_json::from_slice(json).unwrap();
+        sanitize_config(&mut config);
+
+        assert_eq!(config.work_devices, vec!["A", "B", "C"]);
+        assert_eq!(config.work_device_1, "A");
+        assert_eq!(config.work_device_2, "B");
+    }
+
+    #[test]
+    fn removing_an_output_keeps_button_flags_aligned_with_remaining_devices() {
+        let mut config = AppConfig {
+            work_devices: vec!["A".into(), "B".into(), "C".into()],
+            ..AppConfig::default()
+        };
+        config.buttons.push(ButtonConfig {
+            output_enabled: vec![true, false, true],
+            ..ButtonConfig::default()
+        });
+
+        assert!(remove_configured_output(&mut config, 0));
+        assert_eq!(config.work_devices, vec!["B", "C"]);
+        assert_eq!(config.buttons[0].output_enabled, vec![false, true]);
+        assert!(!config.buttons[0].output_1);
+        assert!(config.buttons[0].output_2);
+        assert!(!remove_configured_output(&mut config, 1), "the first two outputs are retained");
     }
 
     #[test]
