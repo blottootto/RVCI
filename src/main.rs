@@ -1081,6 +1081,15 @@ fn remove_configured_output(config: &mut AppConfig, index: usize) -> bool {
     true
 }
 
+fn reorder_button_configs(buttons: &mut Vec<ButtonConfig>, from: usize, to: usize) -> bool {
+    if from >= buttons.len() || to >= buttons.len() || from == to {
+        return false;
+    }
+    let button = buttons.remove(from);
+    buttons.insert(to, button);
+    true
+}
+
 fn process_selection_display(value: &str) -> Option<String> {
     let names = process_selection_names(Some(value));
     if names.iter().any(|name| name.eq_ignore_ascii_case("All")) {
@@ -1773,28 +1782,28 @@ fn switch_process_device(process_name: &str, clean_name: &str) -> Option<String>
     }
 }
 
+fn switch_selected_processes<F>(
+    selection: &str,
+    target: &str,
+    mut route_process: F,
+) -> Option<String>
+where
+    F: FnMut(&str, &str) -> Option<String>,
+{
+    let processes = process_selection_names(Some(selection));
+    let landed_device = processes
+        .iter()
+        .filter_map(|process| route_process(process, target))
+        .last()?;
+    Some(output_osd_label(selection, &landed_device))
+}
+
 fn switch_selected_output(selection: &str, target: &str) -> Option<String> {
     let processes = process_selection_names(Some(selection));
     if processes.iter().any(|name| name.eq_ignore_ascii_case("All")) {
         return switch_device(target).map(|device| output_osd_label("All", &device));
     }
-    if processes.is_empty() {
-        return None;
-    }
-
-    let mut landed_device = None;
-    let mut all_succeeded = true;
-    for process in &processes {
-        if let Some(device) = switch_process_device(process, target) {
-            landed_device = Some(device);
-        } else {
-            all_succeeded = false;
-        }
-    }
-    if !all_succeeded {
-        return None;
-    }
-    Some(output_osd_label(selection, landed_device.as_deref()?))
+    switch_selected_processes(selection, target, switch_process_device)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -3049,6 +3058,7 @@ struct RvciApp {
     save_flash: Option<(Instant, bool)>,
     key_capture: Option<usize>,
     key_capture_since: Instant,
+    button_drag: Option<usize>,
 
     _tray: Option<TrayIcon>,
     want_show: Arc<AtomicBool>,
@@ -3201,6 +3211,7 @@ impl RvciApp {
             save_flash: None,
             key_capture: None,
             key_capture_since: Instant::now(),
+            button_drag: None,
             _tray: tray,
             want_show,
             link,
@@ -3939,13 +3950,29 @@ impl RvciApp {
                 return;
             }
             let mut remove: Option<usize> = None;
+            let mut reorder: Option<(usize, usize)> = None;
             let len = self.cfg.buttons.len();
             let mut rows = Rows::new();
             for i in 0..len {
                 rows.item(ui, |ui| {
                     ui.push_id(("btn", i), |ui| {
                         ui.horizontal(|ui| {
-                            index_badge(ui, i + 1);
+                            let source_index = self.button_drag;
+                            let drag = button_drag_handle(
+                                ui,
+                                i + 1,
+                                source_index.is_some(),
+                                source_index == Some(i),
+                            );
+                            if drag.drag_started() {
+                                self.button_drag = Some(i);
+                            }
+                            if let Some(from) = self.button_drag {
+                                if from != i && drag.hovered() && ui.input(|input| input.pointer.any_released()) {
+                                    reorder = Some((from, i));
+                                    self.button_drag = None;
+                                }
+                            }
                             ui.add_space(2.0);
 
                             let cur_action = self.cfg.buttons[i].action.clone();
@@ -4101,9 +4128,57 @@ impl RvciApp {
                     });
                 });
             }
+            if let Some(from) = self.button_drag {
+                if let Some(pointer) = ui.ctx().pointer_hover_pos() {
+                    let action = action_label(&self.cfg.buttons[from].action);
+                    egui::Area::new(egui::Id::new("button_drag_preview"))
+                        .order(egui::Order::Tooltip)
+                        .fixed_pos(pointer + egui::vec2(16.0, 16.0))
+                        .interactable(false)
+                        .show(ui.ctx(), |ui| {
+                            egui::Frame::none()
+                                .fill(card_bg())
+                                .stroke(egui::Stroke::new(1.0_f32, accent()))
+                                .rounding(egui::Rounding::same(7.0))
+                                .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new(format!("Moving button {}: {action}", from + 1))
+                                            .font(regular(12.5))
+                                            .color(text()),
+                                    );
+                                });
+                        });
+                }
+            }
+            if ui.input(|input| input.pointer.any_released()) {
+                self.button_drag = None;
+            }
+            if remove.is_none() {
+                if let Some((from, to)) = reorder {
+                    if reorder_button_configs(&mut self.cfg.buttons, from, to) {
+                        if let Some(capture) = self.key_capture {
+                            self.key_capture = if capture == from {
+                                Some(to)
+                            } else if from < capture && capture <= to {
+                                Some(capture - 1)
+                            } else if to <= capture && capture < from {
+                                Some(capture + 1)
+                            } else {
+                                Some(capture)
+                            };
+                        }
+                        log_info!("ui: moved button {} to position {}", from + 1, to + 1);
+                    }
+                }
+            }
             if let Some(idx) = remove {
                 if self.key_capture == Some(idx) {
                     self.key_capture = None;
+                } else if let Some(capture) = self.key_capture {
+                    if idx < capture {
+                        self.key_capture = Some(capture - 1);
+                    }
                 }
                 log_info!("ui: removed button {}", idx + 1);
                 self.cfg.buttons.remove(idx);
@@ -4359,6 +4434,41 @@ fn index_badge(ui: &mut egui::Ui, n: usize) {
         semibold(12.0),
         text_muted(),
     );
+}
+
+fn button_drag_handle(
+    ui: &mut egui::Ui,
+    n: usize,
+    drag_active: bool,
+    is_drag_source: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(34.0, 26.0), egui::Sense::drag());
+    let rounding = egui::Rounding::same(7.0);
+    let fill = if is_drag_source {
+        mix(pal().faint_bg, accent(), 0.32)
+    } else {
+        pal().faint_bg
+    };
+    ui.painter().rect_filled(rect, rounding, fill);
+    if drag_active && !is_drag_source && response.hovered() {
+        ui.painter().rect_stroke(rect, rounding, egui::Stroke::new(2.0_f32, accent()));
+    }
+    let grip_x = rect.left() + 7.0;
+    for y in [-4.0, 0.0, 4.0] {
+        ui.painter().circle_filled(
+            egui::pos2(grip_x, rect.center().y + y),
+            1.0,
+            text_faint(),
+        );
+    }
+    ui.painter().text(
+        egui::pos2(rect.left() + 19.0, rect.center().y),
+        egui::Align2::CENTER_CENTER,
+        n.to_string(),
+        semibold(12.0),
+        text_muted(),
+    );
+    response.on_hover_text("Drag to reorder physical button")
 }
 
 const ROW_PAD: f32 = 15.0;
@@ -6672,6 +6782,24 @@ mod tests {
     }
 
     #[test]
+    fn multi_process_output_succeeds_when_any_selected_process_routes() {
+        let mut attempted = Vec::new();
+        let label = switch_selected_processes("Plexamp, firefox", "Monitor", |process, target| {
+            attempted.push(process.to_string());
+            (process == "firefox").then(|| target.to_string())
+        });
+
+        assert_eq!(attempted, vec!["Plexamp", "firefox"]);
+        assert_eq!(label.as_deref(), Some("Plexamp, firefox -> Monitor"));
+    }
+
+    #[test]
+    fn multi_process_output_fails_when_no_selected_process_routes() {
+        let label = switch_selected_processes("Plexamp, firefox", "Monitor", |_, _| None);
+        assert_eq!(label, None);
+    }
+
+    #[test]
     fn multiple_process_selections_round_trip_in_existing_config_fields() {
         let mut config = AppConfig::default();
         config.dials.push(DialConfig {
@@ -6782,6 +6910,30 @@ mod tests {
         state.insert("Plexamp".into(), first.0);
         let second = next_process_output("Plexamp", &button, &config, &state).unwrap();
         assert_eq!(second, (0, "Headphones".into()));
+    }
+
+    #[test]
+    fn button_reordering_moves_the_entire_configuration() {
+        let mut buttons = vec![
+            ButtonConfig {
+                action: "media".into(),
+                media_key: "next".into(),
+                ..ButtonConfig::default()
+            },
+            ButtonConfig {
+                action: "keys".into(),
+                key_combo: "f13".into(),
+                ..ButtonConfig::default()
+            },
+        ];
+
+        assert!(reorder_button_configs(&mut buttons, 1, 0));
+        assert_eq!(buttons[0].action, "keys");
+        assert_eq!(buttons[0].key_combo, "f13");
+        assert_eq!(buttons[1].action, "media");
+        assert_eq!(buttons[1].media_key, "next");
+        assert!(!reorder_button_configs(&mut buttons, 0, 0));
+        assert!(!reorder_button_configs(&mut buttons, 0, 2));
     }
 
     #[test]
