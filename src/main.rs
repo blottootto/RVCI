@@ -26,12 +26,13 @@ use tray_icon::{
     TrayIcon, TrayIconBuilder, Icon, TrayIconEvent, MouseButton,
 };
 
-use windows::core::{Interface, interface, GUID, PCWSTR, PWSTR, IUnknown, IUnknown_Vtbl};
+use windows::core::{Interface, interface, GUID, PCWSTR, PWSTR, HSTRING, IUnknown, IUnknown_Vtbl};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Devices::Communication::{SetCommTimeouts, COMMTIMEOUTS};
 use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::Media::Audio::*;
 use windows::Win32::System::Com::*;
+use windows::Win32::System::WinRT::RoGetActivationFactory;
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
@@ -42,7 +43,6 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     KEYEVENTF_KEYUP, KEYEVENTF_EXTENDEDKEY, VIRTUAL_KEY,
 };
-use windows::core::HSTRING;
 use windows::Data::Xml::Dom::XmlDocument;
 use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
 use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
@@ -708,6 +708,68 @@ mod diag {
 
 const CLSID_PolicyConfigClient: GUID = GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
 
+macro_rules! audio_policy_config_interface {
+    ($name:ident, $iid:literal) => {
+        #[interface($iid)]
+        pub unsafe trait $name: IUnknown {
+            fn inspectable_get_iids(&self) -> windows::core::HRESULT;
+            fn inspectable_get_runtime_class_name(&self) -> windows::core::HRESULT;
+            fn inspectable_get_trust_level(&self) -> windows::core::HRESULT;
+            fn add_ctx_volume_change(&self) -> windows::core::HRESULT;
+            fn remove_ctx_volume_changed(&self) -> windows::core::HRESULT;
+            fn add_ringer_vibrate_state_changed(&self) -> windows::core::HRESULT;
+            fn remove_ringer_vibrate_state_change(&self) -> windows::core::HRESULT;
+            fn set_volume_group_gain_for_id(&self) -> windows::core::HRESULT;
+            fn get_volume_group_gain_for_id(&self) -> windows::core::HRESULT;
+            fn get_active_volume_group_for_endpoint_id(&self) -> windows::core::HRESULT;
+            fn get_volume_groups_for_endpoint(&self) -> windows::core::HRESULT;
+            fn get_current_volume_context(&self) -> windows::core::HRESULT;
+            fn set_volume_group_mute_for_id(&self) -> windows::core::HRESULT;
+            fn get_volume_group_mute_for_id(&self) -> windows::core::HRESULT;
+            fn set_ringer_vibrate_state(&self) -> windows::core::HRESULT;
+            fn get_ringer_vibrate_state(&self) -> windows::core::HRESULT;
+            fn set_preferred_chat_application(&self) -> windows::core::HRESULT;
+            fn reset_preferred_chat_application(&self) -> windows::core::HRESULT;
+            fn get_preferred_chat_application(&self) -> windows::core::HRESULT;
+            fn get_current_chat_applications(&self) -> windows::core::HRESULT;
+            fn add_chat_context_changed(&self) -> windows::core::HRESULT;
+            fn remove_chat_context_changed(&self) -> windows::core::HRESULT;
+            fn set_persisted_default_audio_endpoint(
+                &self,
+                process_id: u32,
+                flow: EDataFlow,
+                role: ERole,
+                device_id: HSTRING,
+            ) -> windows::core::HRESULT;
+        }
+    };
+}
+
+audio_policy_config_interface!(IAudioPolicyConfigFactory21H2, "ab3d4648-e242-459f-b02f-541c70306324");
+audio_policy_config_interface!(IAudioPolicyConfigFactoryDownlevel, "2a59116d-6c4f-45e0-a74f-707e3fef9258");
+
+trait ProcessAudioPolicy {
+    fn set_process_endpoint(
+        &self,
+        process_id: u32,
+        flow: EDataFlow,
+        role: ERole,
+        device_id: &HSTRING,
+    ) -> windows::core::HRESULT;
+}
+
+impl ProcessAudioPolicy for IAudioPolicyConfigFactory21H2 {
+    fn set_process_endpoint(&self, process_id: u32, flow: EDataFlow, role: ERole, device_id: &HSTRING) -> windows::core::HRESULT {
+        unsafe { self.set_persisted_default_audio_endpoint(process_id, flow, role, device_id.clone()) }
+    }
+}
+
+impl ProcessAudioPolicy for IAudioPolicyConfigFactoryDownlevel {
+    fn set_process_endpoint(&self, process_id: u32, flow: EDataFlow, role: ERole, device_id: &HSTRING) -> windows::core::HRESULT {
+        unsafe { self.set_persisted_default_audio_endpoint(process_id, flow, role, device_id.clone()) }
+    }
+}
+
 #[interface("f8679f50-850a-41cf-9c72-430f290290c8")]
 pub unsafe trait IPolicyConfig: IUnknown {
     fn GetMixFormat(&self, pszdeviceid: PCWSTR, ppformat: *mut *mut c_void) -> windows::core::HRESULT;
@@ -754,6 +816,15 @@ struct ButtonConfig {
     modifiers: Vec<String>,
     #[serde(default)]
     key_combo: String,
+
+    #[serde(default)]
+    output_process: String,
+
+    #[serde(default = "default_true")]
+    output_1: bool,
+
+    #[serde(default = "default_true")]
+    output_2: bool,
 }
 
 impl Default for ButtonConfig {
@@ -764,6 +835,9 @@ impl Default for ButtonConfig {
             media_key: "play_pause".to_string(),
             modifiers: vec![],
             key_combo: String::new(),
+            output_process: "None".to_string(),
+            output_1: true,
+            output_2: true,
         }
     }
 }
@@ -1005,6 +1079,14 @@ fn sanitize_config(cfg: &mut AppConfig) {
         if !b.key_combo.is_empty() && token_to_vk(&b.key_combo).is_none() {
             b.key_combo.clear();
         }
+        clip_chars(&mut b.output_process, MAX_NAME_CHARS);
+        if b.output_process.is_empty() {
+            b.output_process = "None".to_string();
+        }
+        if !(b.output_1 || b.output_2) {
+            b.output_1 = true;
+            b.output_2 = true;
+        }
     }
 }
 
@@ -1205,6 +1287,51 @@ impl AudioController {
     }
 }
 
+fn next_process_output(
+    process_name: &str,
+    button: &ButtonConfig,
+    config: &AppConfig,
+    state: &HashMap<String, usize>,
+) -> Option<(usize, String)> {
+    let process_name = process_name.trim();
+    if process_name.is_empty() || process_name == "None" {
+        return None;
+    }
+
+    let valid: Vec<usize> = [0usize, 1usize]
+        .into_iter()
+        .filter(|idx| match idx {
+            0 => button.output_1 && !config.work_device_1.is_empty() && config.work_device_1 != "None",
+            1 => button.output_2 && !config.work_device_2.is_empty() && config.work_device_2 != "None",
+            _ => false,
+        })
+        .collect();
+
+    if valid.is_empty() {
+        return None;
+    }
+
+    let current = state.get(process_name).copied().unwrap_or(0);
+    let next = if valid.len() == 1 {
+        valid[0]
+    } else if valid.contains(&current) {
+        let next_idx = valid.iter().position(|&v| v == current).unwrap_or(0);
+        valid[(next_idx + 1) % valid.len()]
+    } else {
+        valid[0]
+    };
+
+    let target = match next {
+        0 => config.work_device_1.clone(),
+        1 => config.work_device_2.clone(),
+        _ => return None,
+    };
+    if target.is_empty() || target == "None" {
+        return None;
+    }
+    Some((next, target))
+}
+
 fn token_to_vk(token: &str) -> Option<(u16, bool)> {
     let t = token.trim().to_lowercase();
 
@@ -1333,32 +1460,60 @@ impl KeyEmu {
 
 struct AudioScanner;
 impl AudioScanner {
-    fn get_active_sessions() -> Vec<String> {
-        let mut names = HashSet::new();
+    fn get_active_session_processes() -> Vec<(String, u32)> {
+        let mut processes = Vec::new();
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-            if let Ok(mgr) = AudioController::get_session_manager() {
-                if let Ok(enum_sess) = mgr.GetSessionEnumerator() {
-                    if let Ok(count) = enum_sess.GetCount() {
-                        for i in 0..count {
-                            if let Ok(sess) = enum_sess.GetSession(i) {
-                                if let Ok(s2) = Interface::cast::<IAudioSessionControl2>(&sess) {
-                                    if let Ok(pid) = s2.GetProcessId() {
-                                        if pid != 0 {
-                                            let name = AudioController::get_process_name(pid);
-                                            if !name.is_empty() { names.insert(name); }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+            let Ok(enumerator): Result<IMMDeviceEnumerator, _> =
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) else {
+                    return processes;
+                };
+            let Ok(devices) = enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) else {
+                return processes;
+            };
+            let Ok(device_count) = devices.GetCount() else { return processes };
+            for device_index in 0..device_count {
+                let Ok(device) = devices.Item(device_index) else { continue };
+                let Ok(manager) = device.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) else {
+                    continue;
+                };
+                let Ok(sessions) = manager.GetSessionEnumerator() else { continue };
+                let Ok(session_count) = sessions.GetCount() else { continue };
+                for session_index in 0..session_count {
+                    let Ok(session) = sessions.GetSession(session_index) else { continue };
+                    let Ok(control) = Interface::cast::<IAudioSessionControl2>(&session) else {
+                        continue;
+                    };
+                    let Ok(pid) = control.GetProcessId() else { continue };
+                    if pid == 0 { continue; }
+                    let name = AudioController::get_process_name(pid);
+                    if !name.is_empty() {
+                        processes.push((name, pid));
                     }
                 }
             }
         }
-        let mut list: Vec<String> = names.into_iter().collect();
-        list.sort();
-        list
+        processes.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        processes.dedup();
+        processes
+    }
+
+    fn get_active_sessions() -> Vec<String> {
+        let mut names: Vec<String> = Self::get_active_session_processes()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    fn get_process_ids(process_name: &str) -> Vec<u32> {
+        let wanted = strip_exe(process_name).to_lowercase();
+        Self::get_active_session_processes()
+            .into_iter()
+            .filter_map(|(name, pid)| (name.to_lowercase() == wanted).then_some(pid))
+            .collect()
     }
 
     fn get_devices_with_ids(data_flow: EDataFlow) -> Vec<(String, String)> {
@@ -1434,6 +1589,15 @@ fn match_playback_device<'a>(
     devices.iter().find(|(name, _id)| name.to_lowercase().contains(&wanted))
 }
 
+fn persisted_audio_device_id(endpoint_id: &str) -> Option<String> {
+    if endpoint_id.trim().is_empty() {
+        return None;
+    }
+    Some(format!(
+        r"\\?\SWD#MMDEVAPI#{endpoint_id}#{{e6327cad-dcec-4949-ae8a-991e976a79d2}}"
+    ))
+}
+
 fn switch_device(clean_name: &str) -> Option<String> {
     if clean_name == "None" || clean_name.is_empty() { return None; }
     let all_devices = AudioScanner::get_playback_devices_with_ids();
@@ -1459,6 +1623,68 @@ fn switch_device(clean_name: &str) -> Option<String> {
         }
     }
     match_result.map(|(name, _)| name.clone())
+}
+
+fn set_process_endpoint<T: ProcessAudioPolicy>(policy: &T, process_id: u32, device_id: &HSTRING) -> bool {
+    let mut success = false;
+    for role in [eConsole, eMultimedia, eCommunications] {
+        let result = policy.set_process_endpoint(process_id, eRender, role, device_id).ok();
+        if let Err(error) = result {
+            log_warn!("audio: could not route process {process_id} for role {role:?}: {error}");
+        } else {
+            success = true;
+        }
+    }
+    success
+}
+
+fn switch_process_device(process_name: &str, clean_name: &str) -> Option<String> {
+    let process_ids = AudioScanner::get_process_ids(process_name);
+    if process_ids.is_empty() {
+        log_warn!("audio: no active session found for process \"{process_name}\"");
+        return None;
+    }
+
+    let devices = AudioScanner::get_playback_devices_with_ids();
+    let Some((matched, device_id)) = match_playback_device(&devices, clean_name) else {
+        log_warn!("audio: no playback device matches \"{clean_name}\", process not routed");
+        return None;
+    };
+    let Some(device_id) = persisted_audio_device_id(device_id) else {
+        log_warn!("audio: selected playback endpoint has no device ID");
+        return None;
+    };
+    let device_id = HSTRING::from(device_id);
+    let class_name = HSTRING::from("Windows.Media.Internal.AudioPolicyConfig");
+    let policy21 = unsafe { RoGetActivationFactory::<IAudioPolicyConfigFactory21H2>(&class_name) };
+    let mut routed = 0usize;
+
+    if let Ok(policy) = policy21 {
+        for process_id in &process_ids {
+            if set_process_endpoint(&policy, *process_id, &device_id) {
+                routed += 1;
+            }
+        }
+    } else if let Ok(policy) = unsafe {
+        RoGetActivationFactory::<IAudioPolicyConfigFactoryDownlevel>(&class_name)
+    } {
+        for process_id in &process_ids {
+            if set_process_endpoint(&policy, *process_id, &device_id) {
+                routed += 1;
+            }
+        }
+    } else {
+        log_warn!("audio: Windows per-process audio routing API is unavailable");
+        return None;
+    }
+
+    if routed == 0 {
+        log_warn!("audio: failed to route process \"{process_name}\" to {matched}");
+        None
+    } else {
+        log_info!("audio: routed process \"{process_name}\" to {matched} ({routed} process id(s))");
+        Some(matched.clone())
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1904,6 +2130,7 @@ fn run_serial_processing(
 
     let mut button_states: Vec<bool> = vec![false; config.buttons.len()];
     let mut button_fired: Vec<Option<Instant>> = vec![None; config.buttons.len()];
+    let mut output_toggle_state: HashMap<String, usize> = HashMap::new();
 
     let mut mic_device_cache: HashMap<String, IAudioEndpointVolume> = HashMap::new();
     let mut output_device_cache: HashMap<String, IAudioEndpointVolume> = HashMap::new();
@@ -2120,6 +2347,29 @@ fn run_serial_processing(
                                         format_combo(&btn.modifiers, &btn.key_combo)
                                     );
                                     KeyEmu::send_combo(&btn.modifiers, &btn.key_combo);
+                                }
+                            }
+                            "output" => {
+                                if rising && button_ready(&mut button_fired, id) {
+                                    let proc = btn.output_process.trim();
+                                    if proc.is_empty() || proc == "None" {
+                                        log_warn!("input: button {} has no process selected for output toggle", id + 1);
+                                        continue;
+                                    }
+                                    if let Some((next_output, target)) = next_process_output(proc, btn, config, &output_toggle_state) {
+                                        let landed = if proc == "All" {
+                                            switch_device(&target)
+                                        } else {
+                                            switch_process_device(proc, &target)
+                                        };
+                                        if let Some(landed) = landed {
+                                            output_toggle_state.insert(proc.to_string(), next_output);
+                                            log_info!("input: button {} toggled {} to {}", id + 1, proc, landed);
+                                            if config.enable_osd {
+                                                let _ = osd_tx.send(OsdMsg::output(landed));
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             _ => {}
@@ -3676,6 +3926,41 @@ impl RvciApp {
                                             }
                                         });
                                     }
+                                    "output" => {
+                                        let process_options = {
+                                            let mut opts = vec!["None".to_string(), "All".to_string()];
+                                            opts.extend(self.active_processes.iter().cloned());
+                                            opts
+                                        };
+                                        let process_index = process_options
+                                            .iter()
+                                            .position(|p| p == &self.cfg.buttons[i].output_process)
+                                            .unwrap_or(0);
+                                        ui.vertical(|ui| {
+                                            ui.horizontal(|ui| {
+                                                if let Some(pick) = select(
+                                                    ui,
+                                                    ("boutputprocess", i),
+                                                    &process_options[process_index],
+                                                    mid_w,
+                                                    SelectStyle::Inline,
+                                                    &process_options,
+                                                ) {
+                                                    self.cfg.buttons[i].output_process = process_options[pick].clone();
+                                                }
+                                            });
+                                            ui.horizontal(|ui| {
+                                                let mut out1 = self.cfg.buttons[i].output_1;
+                                                let mut out2 = self.cfg.buttons[i].output_2;
+                                                if ui.checkbox(&mut out1, "Output 1").changed() {
+                                                    self.cfg.buttons[i].output_1 = out1;
+                                                }
+                                                if ui.checkbox(&mut out2, "Output 2").changed() {
+                                                    self.cfg.buttons[i].output_2 = out2;
+                                                }
+                                            });
+                                        });
+                                    }
                                     _ => {
                                         quiet_note(ui, "Nothing bound", mid_w);
                                     }
@@ -4943,8 +5228,8 @@ fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
 
 const DIAL_TYPES: [&str; 5] = ["system", "process", "all_others", "microphone", "output_device"];
 const DIAL_TYPE_LABELS: [&str; 5] = ["System", "Process", "Others", "Microphone", "Output device"];
-const ACTIONS: [&str; 4] = ["none", "mute_dial", "media", "keys"];
-const ACTION_LABELS: [&str; 4] = ["None", "Mute knob", "Media", "Keys"];
+const ACTIONS: [&str; 5] = ["none", "mute_dial", "media", "keys", "output"];
+const ACTION_LABELS: [&str; 5] = ["None", "Mute knob", "Media", "Keys", "Output"];
 
 fn dial_type_label(t: &str) -> &'static str {
     DIAL_TYPES
@@ -6209,6 +6494,9 @@ mod tests {
             key_combo: "definitely-not-a-key".into(),
             media_key: "bogus".into(),
             dial_index: 99,
+            output_process: "None".into(),
+            output_1: true,
+            output_2: true,
         }]);
         sanitize_config(&mut cfg);
         let b = &cfg.buttons[0];
@@ -6223,6 +6511,71 @@ mod tests {
         assert_eq!(token_to_vk("f13"), Some((0x7C, false)));
         assert_eq!(token_to_vk("f17"), Some((0x80, false)));
         assert_eq!(token_to_vk("f24"), Some((0x87, false)));
+    }
+
+    #[test]
+    fn process_output_selection_alternates_without_committing_early() {
+        let mut config = AppConfig::default();
+        config.work_device_1 = "Headphones".into();
+        config.work_device_2 = "Monitor".into();
+        let button = ButtonConfig::default();
+        let mut state = HashMap::new();
+
+        let first = next_process_output("Plexamp", &button, &config, &state).unwrap();
+        assert_eq!(first, (1, "Monitor".into()));
+        assert!(!state.contains_key("Plexamp"), "selection must not commit before routing succeeds");
+
+        state.insert("Plexamp".into(), first.0);
+        let second = next_process_output("Plexamp", &button, &config, &state).unwrap();
+        assert_eq!(second, (0, "Headphones".into()));
+    }
+
+    #[test]
+    fn process_output_selection_uses_the_only_checked_output() {
+        let mut config = AppConfig::default();
+        config.work_device_1 = "Headphones".into();
+        config.work_device_2 = "Monitor".into();
+        let button = ButtonConfig {
+            output_1: true,
+            output_2: false,
+            ..ButtonConfig::default()
+        };
+        let mut state = HashMap::new();
+        state.insert("Firefox".into(), 1);
+
+        assert_eq!(
+            next_process_output("Firefox", &button, &config, &state),
+            Some((0, "Headphones".into()))
+        );
+    }
+
+    #[test]
+    fn all_output_selection_cycles_between_configured_devices() {
+        let mut config = AppConfig::default();
+        config.work_device_1 = "Headphones".into();
+        config.work_device_2 = "Monitor".into();
+        let button = ButtonConfig::default();
+        let state = HashMap::new();
+
+        assert_eq!(
+            next_process_output("All", &button, &config, &state),
+            Some((1, "Monitor".into()))
+        );
+    }
+
+    #[test]
+    fn process_output_selection_rejects_missing_targets() {
+        let mut config = AppConfig::default();
+        config.work_device_1 = "Headphones".into();
+        let button = ButtonConfig {
+            output_1: false,
+            output_2: false,
+            ..ButtonConfig::default()
+        };
+        let state = HashMap::new();
+
+        assert_eq!(next_process_output("Plexamp", &button, &config, &state), None);
+        assert_eq!(next_process_output("None", &button, &config, &state), None);
     }
 
     #[test]
@@ -6555,6 +6908,15 @@ mod tests {
         assert!(match_playback_device(&devices, "None").is_none());
         assert!(match_playback_device(&devices, "").is_none());
         assert!(match_playback_device(&devices, "Headphones").is_none());
+    }
+
+    #[test]
+    fn persisted_audio_device_id_uses_windows_long_id_format() {
+        assert_eq!(
+            persisted_audio_device_id("{0.0.0.00000000}.{12345678-1234-1234-1234-123456789abc}"),
+            Some(r"\\?\SWD#MMDEVAPI#{0.0.0.00000000}.{12345678-1234-1234-1234-123456789abc}#{e6327cad-dcec-4949-ae8a-991e976a79d2}".into())
+        );
+        assert_eq!(persisted_audio_device_id("  "), None);
     }
 
     #[test]
