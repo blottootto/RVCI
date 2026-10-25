@@ -1012,6 +1012,7 @@ const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_DIALS: usize = 32;
 const MAX_BUTTONS: usize = 32;
 const MAX_NAME_CHARS: usize = 128;
+const MAX_PROCESS_SELECTION_CHARS: usize = 2048;
 const DEFAULT_VALUE_MAX: f32 = 1024.0;
 const MAX_VALUE_MAX: f32 = 65535.0;
 
@@ -1029,6 +1030,37 @@ fn strip_exe(name: &str) -> &str {
     } else {
         name
     }
+}
+
+fn process_selection_names(value: Option<&str>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    value
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && !name.eq_ignore_ascii_case("None"))
+        .filter(|name| seen.insert(name.to_ascii_lowercase()))
+        .map(str::to_string)
+        .collect()
+}
+
+fn process_selection_display(value: &str) -> Option<String> {
+    let names = process_selection_names(Some(value));
+    if names.iter().any(|name| name.eq_ignore_ascii_case("All")) {
+        return Some("All processes".to_string());
+    }
+    let display = names
+        .iter()
+        .map(|name| strip_exe(name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    (!display.is_empty()).then_some(display)
+}
+
+fn output_osd_label(selection: &str, device: &str) -> String {
+    let process_label = process_selection_display(selection)
+        .unwrap_or_else(|| "Output".to_string());
+    format!("{process_label} -> {device}")
 }
 
 fn sanitize_config(cfg: &mut AppConfig) {
@@ -1059,7 +1091,7 @@ fn sanitize_config(cfg: &mut AppConfig) {
     for d in &mut cfg.dials {
         clip_chars(&mut d.dial_type, MAX_NAME_CHARS);
         if let Some(n) = &mut d.process_name {
-            clip_chars(n, MAX_NAME_CHARS);
+            clip_chars(n, MAX_PROCESS_SELECTION_CHARS);
         }
     }
 
@@ -1079,7 +1111,7 @@ fn sanitize_config(cfg: &mut AppConfig) {
         if !b.key_combo.is_empty() && token_to_vk(&b.key_combo).is_none() {
             b.key_combo.clear();
         }
-        clip_chars(&mut b.output_process, MAX_NAME_CHARS);
+        clip_chars(&mut b.output_process, MAX_PROCESS_SELECTION_CHARS);
         if b.output_process.is_empty() {
             b.output_process = "None".to_string();
         }
@@ -1687,6 +1719,30 @@ fn switch_process_device(process_name: &str, clean_name: &str) -> Option<String>
     }
 }
 
+fn switch_selected_output(selection: &str, target: &str) -> Option<String> {
+    let processes = process_selection_names(Some(selection));
+    if processes.iter().any(|name| name.eq_ignore_ascii_case("All")) {
+        return switch_device(target).map(|device| output_osd_label("All", &device));
+    }
+    if processes.is_empty() {
+        return None;
+    }
+
+    let mut landed_device = None;
+    let mut all_succeeded = true;
+    for process in &processes {
+        if let Some(device) = switch_process_device(process, target) {
+            landed_device = Some(device);
+        } else {
+            all_succeeded = false;
+        }
+    }
+    if !all_succeeded {
+        return None;
+    }
+    Some(output_osd_label(selection, landed_device.as_deref()?))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SerialStatus {
     Idle,
@@ -1879,12 +1935,7 @@ fn osd_label(d: &DialConfig) -> Option<String> {
         "all_others" => Some("Other Apps".to_string()),
         _ => {
             let target = d.process_name.as_deref().unwrap_or("");
-            if target.is_empty() || target == "None" {
-                return None;
-            }
-            // Use the first process name in the list for the OSD label
-            let first = target.split(',').next().unwrap_or("").trim();
-            Some(strip_exe(first).to_string())
+            process_selection_display(target)
         }
     }
 }
@@ -2357,16 +2408,11 @@ fn run_serial_processing(
                                         continue;
                                     }
                                     if let Some((next_output, target)) = next_process_output(proc, btn, config, &output_toggle_state) {
-                                        let landed = if proc == "All" {
-                                            switch_device(&target)
-                                        } else {
-                                            switch_process_device(proc, &target)
-                                        };
-                                        if let Some(landed) = landed {
+                                        if let Some(label) = switch_selected_output(proc, &target) {
                                             output_toggle_state.insert(proc.to_string(), next_output);
-                                            log_info!("input: button {} toggled {} to {}", id + 1, proc, landed);
+                                            log_info!("input: button {} toggled {} to {}", id + 1, proc, target);
                                             if config.enable_osd {
-                                                let _ = osd_tx.send(OsdMsg::output(landed));
+                                                let _ = osd_tx.send(OsdMsg::output(label));
                                             }
                                         }
                                     }
@@ -3760,18 +3806,37 @@ impl RvciApp {
                                     .process_name
                                     .clone()
                                     .unwrap_or_else(|| "None".to_string());
-                                let mut options: Vec<String> = vec!["None".to_string()];
-                                options.extend(source.iter().cloned());
                                 let w = ui.available_width();
                                 if has_target {
-                                    if let Some(pick) =
-                                        select(ui, "ktarget", &cur, w, SelectStyle::Inline, &options)
-                                    {
-                                        self.cfg.dials[i].process_name = if pick == 0 {
-                                            None
-                                        } else {
-                                            Some(options[pick].clone())
-                                        };
+                                    if dtype == "process" {
+                                        if let Some(selection) = multi_process_select(
+                                            ui,
+                                            ("dial_process", i),
+                                            &cur,
+                                            source,
+                                            w,
+                                            false,
+                                        ) {
+                                            self.cfg.dials[i].process_name =
+                                                (selection != "None").then_some(selection);
+                                        }
+                                    } else {
+                                        let mut options: Vec<String> = vec!["None".to_string()];
+                                        options.extend(source.iter().cloned());
+                                        if let Some(pick) = select(
+                                            ui,
+                                            "ktarget",
+                                            &cur,
+                                            w,
+                                            SelectStyle::Inline,
+                                            &options,
+                                        ) {
+                                            self.cfg.dials[i].process_name = if pick == 0 {
+                                                None
+                                            } else {
+                                                Some(options[pick].clone())
+                                            };
+                                        }
                                     }
                                 } else {
                                     quiet_note(ui, "Whole system", w);
@@ -3927,28 +3992,18 @@ impl RvciApp {
                                         });
                                     }
                                     "output" => {
-                                        let process_options = {
-                                            let mut opts = vec!["None".to_string(), "All".to_string()];
-                                            opts.extend(self.active_processes.iter().cloned());
-                                            opts
-                                        };
-                                        let process_index = process_options
-                                            .iter()
-                                            .position(|p| p == &self.cfg.buttons[i].output_process)
-                                            .unwrap_or(0);
+                                        let current = self.cfg.buttons[i].output_process.clone();
                                         ui.vertical(|ui| {
-                                            ui.horizontal(|ui| {
-                                                if let Some(pick) = select(
+                                            if let Some(selection) = multi_process_select(
                                                     ui,
                                                     ("boutputprocess", i),
-                                                    &process_options[process_index],
+                                                    &current,
+                                                    &self.active_processes,
                                                     mid_w,
-                                                    SelectStyle::Inline,
-                                                    &process_options,
+                                                    true,
                                                 ) {
-                                                    self.cfg.buttons[i].output_process = process_options[pick].clone();
-                                                }
-                                            });
+                                                self.cfg.buttons[i].output_process = selection;
+                                            }
                                             ui.horizontal(|ui| {
                                                 let mut out1 = self.cfg.buttons[i].output_1;
                                                 let mut out2 = self.cfg.buttons[i].output_2;
@@ -4780,6 +4835,80 @@ fn select<S: AsRef<str>>(
         }
     }
     picked
+}
+
+fn multi_process_select(
+    ui: &mut egui::Ui,
+    id_src: impl std::hash::Hash + Clone,
+    current: &str,
+    processes: &[String],
+    width: f32,
+    allow_all: bool,
+) -> Option<String> {
+    let original = process_selection_names(Some(current));
+    let mut selected = original.clone();
+    if allow_all && selected.iter().any(|name| name.eq_ignore_ascii_case("All")) {
+        selected = vec!["All".to_string()];
+    }
+    let rows = if selected == ["All"] { 1 } else { selected.len() + 1 };
+
+    ui.vertical(|ui| {
+        for row in 0..rows {
+            let current_row = selected.get(row).cloned().unwrap_or_else(|| "None".to_string());
+            let mut choices = vec!["None".to_string()];
+            if allow_all {
+                choices.push("All".to_string());
+            }
+            choices.extend(processes.iter().filter(|process| {
+                !process.eq_ignore_ascii_case("None")
+                    && !process.eq_ignore_ascii_case("All")
+                    && !selected.iter().enumerate().any(|(index, selected)| {
+                        index != row && selected.eq_ignore_ascii_case(process)
+                    })
+            }).cloned());
+
+                    let mut row_changed = false;
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("Process {}", row + 1)).font(regular(12.5)).color(text_muted()));
+                if let Some(pick) = select(
+                    ui,
+                    (id_src.clone(), row),
+                    &current_row,
+                    (width - 76.0).max(80.0),
+                    SelectStyle::Inline,
+                    &choices,
+                ) {
+                    let choice = choices[pick].clone();
+                    if choice == "None" {
+                        if row < selected.len() {
+                            selected.remove(row);
+                            row_changed = true;
+                        }
+                    } else if choice == "All" {
+                        selected = vec![choice];
+                        row_changed = true;
+                    } else if row < selected.len() {
+                        selected[row] = choice;
+                        row_changed = true;
+                    } else {
+                        selected.push(choice);
+                        row_changed = true;
+                    }
+                }
+            });
+            if row_changed {
+                break;
+            }
+        }
+    });
+
+    (selected != original).then(|| {
+        if selected.is_empty() {
+            "None".to_string()
+        } else {
+            selected.join(", ")
+        }
+    })
 }
 
 fn switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
