@@ -3028,7 +3028,7 @@ fn paint_vgrad(painter: &egui::Painter, rect: egui::Rect, top: Color32, bottom: 
 
 const BAUD_RATES: [u32; 5] = [9600, 19200, 38400, 57600, 115200];
 
-const GITHUB_URL: &str = "https://github.com/tzeys/rvci";
+const GITHUB_URL: &str = "https://github.com/blottootto/RVCI";
 const GITHUB_PNG: &[u8] = include_bytes!("../assets/github.png");
 
 struct RvciApp {
@@ -4228,7 +4228,7 @@ impl RvciApp {
     fn credit(&mut self, ui: &mut egui::Ui) {
         self.github_link(ui);
         ui.add_space(10.0);
-        ui.label(RichText::new("Made by TZey").font(regular(12.5)).color(text_faint()));
+        ui.label(RichText::new("Made by TZey, modified by blottootto").font(regular(12.5)).color(text_faint()));
     }
 
     fn github_link(&mut self, ui: &mut egui::Ui) {

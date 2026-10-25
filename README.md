@@ -1,3 +1,29 @@
+## Recent feature additions and usage
+
+The current version extends the original configuration GUI and audio controls with the features below.
+
+**AI assistance disclosure:** AI tools assisted with code and documentation changes in this fork. These modifications may contain errors; review and test them before relying on them.
+
+### Map F13–F24 buttons
+
+In **Buttons**, select **Keys**. Use the function-key dropdown to choose F1 through F24, or use the recording control to capture a supported key or key combination. Save the configuration to persist the binding.
+
+### Control several processes with one knob
+
+In **Knobs**, set the knob type to **Process**. Select a process in the first row; another process selector appears below it. Add more processes the same way, or choose **None** on a row to remove that selection. A single knob then controls the selected processes together. The selections are saved in the existing comma-delimited `process_name` config value.
+
+The volume OSD displays the names of all selected processes. Longer labels expand the OSD to make more of the names visible.
+
+### Configure additional audio outputs
+
+In **Output switcher**, use **Add output** to configure more than the original two playback devices. Up to 16 outputs can be configured; the first two remain connected to the firmware's existing `WORKS 1` and `WORKS 2` commands.
+
+For a button, choose **Output**, then select one or more processes. Each selected process gets its own row. Choose which configured outputs that button should cycle through by checking their output boxes. Pressing the physical button moves the selected process or processes to the next checked output. The OSD identifies the selected process names and destination.
+
+Choose **All** instead of named processes to switch the system-wide default output using the original global switch function. This affects audio from all applications.
+
+Output selections are saved in `mapping.json`. Existing configurations with only Output 1 and Output 2 are migrated automatically; process lists continue to use comma-delimited values.
+
 <img width="144" height="144" alt="rvci" src="https://github.com/user-attachments/assets/d20da90c-899d-4941-a34f-7a460fd544d3" /> 
 
 # RVCI
