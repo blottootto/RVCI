@@ -8,15 +8,21 @@ The current version extends the original configuration GUI and audio controls wi
 
 In **Buttons**, select **Keys**. Use the function-key dropdown to choose F1 through F24, or use the recording control to capture a supported key or key combination. Save the configuration to persist the binding.
 
+![Buttons configured with F13 and F14 keys and a multi-process Output action](assets/buttons-f13-multiprocess-output.png)
+
 ### Control several processes with one knob
 
 In **Knobs**, set the knob type to **Process**. Select a process in the first row; another process selector appears below it. Add more processes the same way, or choose **None** on a row to remove that selection. A single knob then controls the selected processes together. The selections are saved in the existing comma-delimited `process_name` config value.
 
 The volume OSD displays the names of all selected processes. Longer labels expand the OSD to make more of the names visible.
 
+![A process knob configured for multiple applications](assets/knob-multiple-processes.png)
+
 ### Configure additional audio outputs
 
 In **Output switcher**, use **Add output** to configure more than the original two playback devices. Up to 16 outputs can be configured; the first two remain connected to the firmware's existing `WORKS 1` and `WORKS 2` commands.
+
+![Output switcher configured with three audio devices](assets/output-switcher-multiple-devices.png)
 
 For a button, choose **Output**, then select one or more processes. Each selected process gets its own row. Choose which configured outputs that button should cycle through by checking their output boxes. Pressing the physical button moves the selected process or processes to the next checked output. The OSD identifies the selected process names and destination.
 
