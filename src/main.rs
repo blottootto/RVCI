@@ -1,5 +1,6 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
+use serialport::SerialPort;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -1653,7 +1654,9 @@ fn osd_label(d: &DialConfig) -> Option<String> {
             if target.is_empty() || target == "None" {
                 return None;
             }
-            Some(strip_exe(target).to_string())
+            // Use the first process name in the list for the OSD label
+            let first = target.split(',').next().unwrap_or("").trim();
+            Some(strip_exe(first).to_string())
         }
     }
 }
@@ -1842,6 +1845,8 @@ fn use_wch_safe_timeouts(port: serialport::COMPort) -> serialport::Result<serial
     Ok(port)
 }
 
+
+////////////////////////////////////////////////////////////////////////////
 fn run_serial_processing(
     config: &AppConfig,
     config_path: &Path,
@@ -1854,7 +1859,12 @@ fn run_serial_processing(
         .open_native()
         .and_then(use_wch_safe_timeouts)
     {
-        Ok(p) => p,
+        Ok(mut p) => {
+            // Assert DTR and RTS to wake up native USB Arduino boards
+            let _ = p.write_data_terminal_ready(true);
+            let _ = p.write_request_to_send(true); 
+            p
+        },
         Err(e) => {
             let status = classify_serial_error(&e);
             log_warn!(
@@ -1907,19 +1917,29 @@ fn run_serial_processing(
         }
     }
 
-    let dial_targets: Vec<Option<String>> = config
+// 1. Extract and split multiple comma-separated targets per dial
+    let dial_targets: Vec<Vec<String>> = config
         .dials
         .iter()
         .map(|d| {
-            d.process_name.as_ref().and_then(|n| {
-                if n == "None" {
-                    return None;
-                }
-                let clean = strip_exe(n).to_lowercase();
-                if clean.is_empty() { None } else { Some(clean) }
-            })
+            match &d.process_name {
+                Some(n) if n != "None" => n
+                    .split(',')
+                    .map(|s| strip_exe(s.trim()).to_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+                _ => Vec::new(),
+            }
         })
         .collect();
+
+    // 2. Populate the global exclusion map for the "all_others" dial using the split targets
+    let mut process_map: HashSet<String> = HashSet::new();
+    for targets in &dial_targets {
+        for target_name in targets {
+            process_map.insert(target_name.clone());
+        }
+    }
 
     unsafe { let _ = CoInitializeEx(None, COINIT_MULTITHREADED); }
     let mut last_file_mod = std::fs::metadata(config_path).and_then(|m| m.modified()).ok();
@@ -2022,6 +2042,8 @@ fn run_serial_processing(
         if line.is_empty() {
             continue;
         }
+
+        //log_info!("DEBUG SERIAL INPUT: {}", line);
 
         if line == "WORKS 1" || line == "WORKS 2" {
             let target = if line == "WORKS 1" { &config.work_device_1 } else { &config.work_device_2 };
@@ -2240,8 +2262,8 @@ fn run_serial_processing(
                             }
                         }
                         "process" | "all_others" => {
-                            let target = dial_targets.get(i).and_then(|t| t.as_ref());
-                            if dial_cfg.dial_type == "process" && target.is_none() {
+                            let targets = dial_targets.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
+                            if dial_cfg.dial_type == "process" && targets.is_empty() {
                                 continue;
                             }
                             if sessions.stale() {
@@ -2251,7 +2273,7 @@ fn run_serial_processing(
                                 let should_change = if dial_cfg.dial_type == "all_others" {
                                     !process_map.contains(pname)
                                 } else {
-                                    Some(pname) == target
+                                    targets.contains(pname)
                                 };
                                 if should_change {
                                     let _ = vol.SetMasterVolume(level, std::ptr::null());
@@ -3176,7 +3198,7 @@ impl RvciApp {
         let mut open = self.show_themes;
         let frame = egui::Frame::window(&ctx.style())
             .fill(card_bg())
-            .stroke(egui::Stroke::new(1.0, card_border()))
+            .stroke(egui::Stroke::new(1.0_f32, card_border()))
             .rounding(egui::Rounding::same(18.0))
             .inner_margin(egui::Margin::same(22.0))
             .shadow(egui::epaint::Shadow {
@@ -3249,7 +3271,7 @@ impl RvciApp {
         let mut open = self.show_osd_spot;
         let frame = egui::Frame::window(&ctx.style())
             .fill(card_bg())
-            .stroke(egui::Stroke::new(1.0, card_border()))
+            .stroke(egui::Stroke::new(1.0_f32, card_border()))
             .rounding(egui::Rounding::same(18.0))
             .inner_margin(egui::Margin::same(22.0))
             .shadow(egui::epaint::Shadow {
@@ -3721,7 +3743,7 @@ impl RvciApp {
                 ui.painter().hline(
                     r.left() - 20.0..=r.right() + 20.0,
                     r.top() - 13.0,
-                    egui::Stroke::new(1.0, separator()),
+                    egui::Stroke::new(1.0_f32, separator()),
                 );
                 ui.horizontal(|ui| {
                     let (label, base, hover) = match self.save_flash {
@@ -3821,7 +3843,7 @@ fn theme_tile(ui: &mut egui::Ui, name: &str, p: &Palette, selected: bool) -> boo
         egui::pos2(rect.right() - 11.0, rect.bottom() - 31.0),
     );
     painter.rect_filled(card_r, egui::Rounding::same(9.0), p.card_bg);
-    painter.rect_stroke(card_r, egui::Rounding::same(9.0), egui::Stroke::new(1.0, p.card_border));
+    painter.rect_stroke(card_r, egui::Rounding::same(9.0), egui::Stroke::new(1.0_f32, p.card_border));
 
     let mut y = card_r.top() + 11.0;
     for w in [0.62_f32, 0.44] {
@@ -3857,13 +3879,13 @@ fn theme_tile(ui: &mut egui::Ui, name: &str, p: &Palette, selected: bool) -> boo
     if selected {
         let c = egui::pos2(rect.right() - 20.0, rect.bottom() - 16.0);
         painter.circle_filled(c, 8.0, p.accent);
-        let s = egui::Stroke::new(1.8, contrast_text(p.accent));
+        let s = egui::Stroke::new(1.8_f32, contrast_text(p.accent));
         painter.line_segment([c + egui::vec2(-3.5, 0.2), c + egui::vec2(-1.0, 2.8)], s);
         painter.line_segment([c + egui::vec2(-1.0, 2.8), c + egui::vec2(3.8, -3.0)], s);
     }
 
     let (bw, bc) = if selected {
-        (2.0, accent())
+        (2.0_f32, accent())
     } else if resp.hovered() {
         (1.0, text_faint())
     } else {
@@ -3912,7 +3934,7 @@ fn hairline(ui: &mut egui::Ui) {
     ui.painter().hline(
         (rect.left() + ROW_PAD)..=rect.right(),
         rect.top() + 0.5,
-        egui::Stroke::new(1.0, separator()),
+        egui::Stroke::new(1.0_f32, separator()),
     );
 }
 
@@ -3933,7 +3955,7 @@ fn group<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let width = layout_w().min(ui.available_width());
     egui::Frame::none()
         .fill(card_bg())
-        .stroke(egui::Stroke::new(1.0, card_border()))
+        .stroke(egui::Stroke::new(1.0_f32, card_border()))
         .rounding(egui::Rounding::same(14.0))
         .inner_margin(egui::Margin::symmetric(0.0, 6.0))
         .show(ui, |ui| {
@@ -4011,7 +4033,7 @@ fn label_cell_enabled(ui: &mut egui::Ui, label: &str, enabled: bool) {
 fn notice(ui: &mut egui::Ui, message: &str) {
     egui::Frame::none()
         .fill(pal().faint_bg)
-        .stroke(egui::Stroke::new(1.0, mix(card_border(), warning(), 0.5)))
+        .stroke(egui::Stroke::new(1.0_f32, mix(card_border(), warning(), 0.5)))
         .rounding(egui::Rounding::same(10.0))
         .inner_margin(egui::Margin::symmetric(13.0, 10.0))
         .show(ui, |ui| {
@@ -4087,7 +4109,7 @@ fn status_pill(ui: &mut egui::Ui, status: SerialStatus) {
 fn chevron(painter: &egui::Painter, center: egui::Pos2, color: Color32, up: bool) {
     let half_w = 4.2;
     let half_h = if up { -2.6 } else { 2.6 };
-    let stroke = egui::Stroke::new(1.7, color);
+    let stroke = egui::Stroke::new(1.0_f32, color);
     let a = egui::pos2(center.x - half_w, center.y - half_h * 0.5);
     let b = egui::pos2(center.x, center.y + half_h * 0.5);
     let c = egui::pos2(center.x + half_w, center.y - half_h * 0.5);
@@ -4096,7 +4118,7 @@ fn chevron(painter: &egui::Painter, center: egui::Pos2, color: Color32, up: bool
 }
 
 fn chevron_right(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
-    let stroke = egui::Stroke::new(1.7, color);
+    let stroke = egui::Stroke::new(1.0_f32, color);
     let a = egui::pos2(center.x - 1.7, center.y - 4.3);
     let b = egui::pos2(center.x + 2.3, center.y);
     let c = egui::pos2(center.x - 1.7, center.y + 4.3);
@@ -4124,7 +4146,7 @@ fn disclosure(ui: &mut egui::Ui, value: &str, width: f32) -> bool {
     }
     if resp.has_focus() {
         ui.painter()
-            .rect_stroke(rect, rounding, egui::Stroke::new(2.0, accent()));
+            .rect_stroke(rect, rounding, egui::Stroke::new(2.0_f32, accent()));
     }
 
     let col = dim(text_muted());
@@ -4167,7 +4189,7 @@ fn spot_picker(ui: &mut egui::Ui, current: usize) -> Option<usize> {
     ui.painter().rect_stroke(
         screen,
         egui::Rounding::same(SCREEN_R),
-        egui::Stroke::new(1.0, card_border()),
+        egui::Stroke::new(1.0_f32, card_border()),
     );
 
     let spot_w = (w * 0.24).round();
@@ -4290,7 +4312,7 @@ fn monitor_map(ui: &mut egui::Ui, monitors: &[MonitorInfo], active: &str) -> Opt
             widget_bg()
         };
         let (sw, sc) = if selected {
-            (2.0, accent())
+            (2.0_f32, accent())
         } else if resp.hovered() {
             (1.0, text_faint())
         } else {
@@ -4380,7 +4402,7 @@ fn select<S: AsRef<str>>(
             }
         }
         if resp.has_focus() {
-            painter.rect_stroke(rect, rounding, egui::Stroke::new(2.0, accent()));
+            painter.rect_stroke(rect, rounding, egui::Stroke::new(2.0_f32, accent()));
         }
     }
 
@@ -4451,10 +4473,10 @@ fn switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
     let painter = ui.painter();
     painter.rect_filled(rect, rounding, fill);
     if resp.hovered() {
-        painter.rect_stroke(rect, rounding, egui::Stroke::new(1.0, mix(fill, text(), 0.3)));
+        painter.rect_stroke(rect, rounding, egui::Stroke::new(1.0_f32, mix(fill, text(), 0.3)));
     }
     if resp.has_focus() {
-        painter.rect_stroke(rect.expand(2.0), egui::Rounding::same(radius + 2.0), egui::Stroke::new(2.0, accent()));
+        painter.rect_stroke(rect.expand(2.0), egui::Rounding::same(radius + 2.0), egui::Stroke::new(2.0_f32, accent()));
     }
     let knob_r = radius - 2.5;
     let cx = egui::lerp((rect.left() + radius)..=(rect.right() - radius), t);
@@ -4671,23 +4693,23 @@ fn configure_visuals(ctx: &egui::Context) {
     visuals.override_text_color = Some(text());
 
     visuals.widgets.noninteractive.bg_fill = card_bg();
-    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, text_muted());
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, text_muted());
     visuals.widgets.inactive.bg_fill = widget_bg();
     visuals.widgets.inactive.weak_bg_fill = widget_bg();
-    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, text());
-    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, card_border());
+    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, text());
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, card_border());
     visuals.widgets.hovered.bg_fill = row_hover();
     visuals.widgets.hovered.weak_bg_fill = row_hover();
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, mix(card_border(), text_muted(), 0.45));
-    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, text());
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, mix(card_border(), text_muted(), 0.45));
+    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, text());
     visuals.widgets.active.bg_fill = row_hover();
-    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, accent());
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, accent());
     visuals.widgets.open.bg_fill = widget_bg();
 
     visuals.selection.bg_fill = accent().linear_multiply(0.55);
-    visuals.selection.stroke = egui::Stroke::new(1.0, accent());
+    visuals.selection.stroke = egui::Stroke::new(1.0_f32, accent());
     visuals.hyperlink_color = accent();
-    visuals.window_stroke = egui::Stroke::new(1.0, card_border());
+    visuals.window_stroke = egui::Stroke::new(1.0_f32, card_border());
     visuals.popup_shadow = egui::epaint::Shadow {
         offset: egui::vec2(0.0, 4.0),
         blur: 16.0,
@@ -4775,7 +4797,7 @@ fn filled_button(
         ui.painter().rect_stroke(
             rect.expand(2.0),
             egui::Rounding::same(rect.height() * 0.5 + 2.0),
-            egui::Stroke::new(2.0, accent()),
+            egui::Stroke::new(2.0_f32, accent()),
         );
     }
     let text_pos = rect.center() - galley.size() / 2.0;
@@ -4809,12 +4831,12 @@ fn ghost_button(ui: &mut egui::Ui, label: &str, min: egui::Vec2) -> egui::Respon
         );
     }
     ui.painter()
-        .rect_stroke(rect, rounding, egui::Stroke::new(1.0, card_border()));
+        .rect_stroke(rect, rounding, egui::Stroke::new(1.0_f32, card_border()));
     if resp.has_focus() {
         ui.painter().rect_stroke(
             rect.expand(2.0),
             egui::Rounding::same(rect.height() * 0.5 + 2.0),
-            egui::Stroke::new(2.0, accent()),
+            egui::Stroke::new(2.0_f32, accent()),
         );
     }
     let pos = rect.center() - galley.size() / 2.0;
@@ -4842,7 +4864,7 @@ fn text_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
         ui.painter().rect_stroke(
             rect,
             egui::Rounding::same(rect.height() * 0.5),
-            egui::Stroke::new(2.0, accent()),
+            egui::Stroke::new(2.0_f32, accent()),
         );
     }
     let col = lerp_color(accent(), accent_hover(), t);
@@ -4857,17 +4879,17 @@ fn delete_button(ui: &mut egui::Ui) -> egui::Response {
         let d = destructive();
         ui.painter().rect_filled(
             rect,
-            egui::Rounding::same(13.0),
+            egui::Rounding::same(13.0_f32),
             Color32::from_rgba_unmultiplied(d.r(), d.g(), d.b(), (t * 45.0) as u8),
         );
     }
     if resp.has_focus() {
         ui.painter()
-            .rect_stroke(rect, egui::Rounding::same(13.0), egui::Stroke::new(2.0, accent()));
+            .rect_stroke(rect, egui::Rounding::same(13.0), egui::Stroke::new(2.0_f32, accent()));
     }
     let col = lerp_color(text_faint(), destructive(), t);
     let c = rect.center();
-    let s = egui::Stroke::new(1.6, col);
+    let s = egui::Stroke::new(1.6_f32, col);
     let d = 4.6;
     ui.painter()
         .line_segment([c + egui::vec2(-d, -d), c + egui::vec2(d, d)], s);
@@ -6080,11 +6102,17 @@ mod tests {
             process_name: Some("Spotify.EXE".into()),
             inverted: false,
         };
+        let multi = DialConfig {
+            dial_type: "process".into(),
+            process_name: Some("Firefox, Plexamp".into()),
+            inverted: false,
+        };
         assert_eq!(osd_label(&sys).as_deref(), Some("Master Volume"));
         assert_eq!(osd_label(&others).as_deref(), Some("Other Apps"));
         assert_eq!(osd_label(&none), None);
         assert_eq!(osd_label(&empty), None);
         assert_eq!(osd_label(&app).as_deref(), Some("Spotify"));
+        assert_eq!(osd_label(&multi).as_deref(), Some("Firefox"));
     }
 
     #[test]
