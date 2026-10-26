@@ -2417,17 +2417,16 @@ fn run_serial_processing(
         }
         let room = MAX_SERIAL_LINE.saturating_sub(raw_line.len() as u64);
         let read = (&mut reader).take(room).read_until(b'\n', &mut raw_line);
-        line_pending = false;
         match read {
             Ok(0) => {
-                line_pending = true;
-                std::thread::sleep(Duration::from_millis(10));
+                line_pending = !raw_line.is_empty();
+                std::thread::sleep(Duration::from_millis(1));
                 continue;
             }
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                line_pending = true;
-                std::thread::sleep(Duration::from_millis(10));
+                line_pending = !raw_line.is_empty();
+                std::thread::sleep(Duration::from_millis(1));
                 continue;
             }
             Err(e) => {
@@ -2440,16 +2439,25 @@ fn run_serial_processing(
         let terminated = raw_line.last() == Some(&b'\n');
         if discarding {
             discarding = !terminated;
+            line_pending = false;
             continue;
         }
-        if !terminated && raw_line.len() as u64 >= MAX_SERIAL_LINE {
-            log_warn!(
-                "serial: oversized line from {} (over {MAX_SERIAL_LINE} bytes), discarding to the next newline",
-                config.serial.port
-            );
-            discarding = true;
+        if !terminated {
+            if raw_line.len() as u64 >= MAX_SERIAL_LINE {
+                log_warn!(
+                    "serial: oversized line from {} (over {MAX_SERIAL_LINE} bytes), discarding to the next newline",
+                    config.serial.port
+                );
+                discarding = true;
+                raw_line.clear();
+                line_pending = false;
+            } else {
+                line_pending = true;
+                std::thread::sleep(Duration::from_millis(1));
+            }
             continue;
         }
+        line_pending = false;
 
         let decoded = String::from_utf8_lossy(&raw_line);
         let line = decoded.trim();
@@ -2571,7 +2579,7 @@ fn run_serial_processing(
             settle = 14;
         }
 
-        if last_update.elapsed() < Duration::from_millis(25) {
+        if last_update.elapsed() < Duration::from_millis(10) {
             continue;
         }
         last_update = Instant::now();
@@ -2579,12 +2587,26 @@ fn run_serial_processing(
             settle -= 1;
         }
 
-        let parts: Vec<&str> = line.split('|').collect();
-        if dial_count == 0 || parts.len() < dial_count {
+        if dial_count == 0 {
+            continue;
+        }
+
+        let mut parts = [""; MAX_DIALS];
+        let mut count = 0;
+        for part in line.split('|') {
+            if count < MAX_DIALS {
+                parts[count] = part;
+            }
+            count += 1;
+        }
+        if count < dial_count {
             continue;
         }
 
         for (i, dial_cfg) in config.dials.iter().enumerate() {
+            if i >= parts.len() {
+                break;
+            }
             let Ok(raw_val) = parts[i].parse::<f32>() else { continue };
             if !raw_val.is_finite() {
                 continue;
