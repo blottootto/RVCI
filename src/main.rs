@@ -3,6 +3,7 @@
 use serialport::SerialPort;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use serde::ser::SerializeStruct;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
@@ -801,7 +802,7 @@ struct DialConfig {
 
 fn default_string_none() -> String { "None".to_string() }
 
-#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[derive(Deserialize, Debug, Clone, PartialEq)]
 struct ButtonConfig {
     #[serde(default = "default_string_none")]
     action: String,
@@ -820,14 +821,39 @@ struct ButtonConfig {
     #[serde(default)]
     output_process: String,
 
-    #[serde(default = "default_true")]
-    output_1: bool,
-
-    #[serde(default = "default_true")]
-    output_2: bool,
-
     #[serde(default)]
     output_enabled: Vec<bool>,
+}
+
+impl Serialize for ButtonConfig {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let fields = match self.action.as_str() {
+            "mute_dial" => 2,
+            "media" => 2,
+            "keys" => 3,
+            "output" => 3,
+            _ => 1,
+        };
+        let mut state = serializer.serialize_struct("ButtonConfig", fields)?;
+        state.serialize_field("action", &self.action)?;
+        match self.action.as_str() {
+            "mute_dial" => state.serialize_field("dial_index", &self.dial_index)?,
+            "media" => state.serialize_field("media_key", &self.media_key)?,
+            "keys" => {
+                state.serialize_field("modifiers", &self.modifiers)?;
+                state.serialize_field("key_combo", &self.key_combo)?;
+            }
+            "output" => {
+                state.serialize_field("output_process", &self.output_process)?;
+                state.serialize_field("output_enabled", &self.output_enabled)?;
+            }
+            _ => {}
+        }
+        state.end()
+    }
 }
 
 impl Default for ButtonConfig {
@@ -839,8 +865,6 @@ impl Default for ButtonConfig {
             modifiers: vec![],
             key_combo: String::new(),
             output_process: "None".to_string(),
-            output_1: true,
-            output_2: true,
             output_enabled: Vec::new(),
         }
     }
@@ -850,10 +874,6 @@ impl Default for ButtonConfig {
 struct AppConfig {
     serial: SerialConfig,
     value_max: f32,
-    #[serde(default = "default_string_none")]
-    work_device_1: String,
-    #[serde(default = "default_string_none")]
-    work_device_2: String,
     #[serde(default)]
     work_devices: Vec<String>,
     #[serde(default)]
@@ -983,8 +1003,6 @@ impl Default for AppConfig {
         Self {
             serial: SerialConfig { port: "COM3".to_string(), baud: 115200, timeout: 50 },
             value_max: 720.0,
-            work_device_1: "None".to_string(),
-            work_device_2: "None".to_string(),
             work_devices: vec!["None".to_string(), "None".to_string()],
             debug_mode: false,
             use_logarithmic_scale: false,
@@ -1055,11 +1073,7 @@ fn process_selection_names(value: Option<&str>) -> Vec<String> {
 }
 
 fn button_output_enabled(button: &ButtonConfig, index: usize) -> bool {
-    button.output_enabled.get(index).copied().unwrap_or(match index {
-        0 => button.output_1,
-        1 => button.output_2,
-        _ => true,
-    })
+    button.output_enabled.get(index).copied().unwrap_or(true)
 }
 
 fn remove_configured_output(config: &mut AppConfig, index: usize) -> bool {
@@ -1068,15 +1082,10 @@ fn remove_configured_output(config: &mut AppConfig, index: usize) -> bool {
     }
     config.work_devices.remove(index);
     for button in &mut config.buttons {
-        if button.output_enabled.is_empty() {
-            button.output_enabled = vec![button.output_1, button.output_2];
-        }
         if index < button.output_enabled.len() {
             button.output_enabled.remove(index);
         }
         button.output_enabled.resize(config.work_devices.len(), true);
-        button.output_1 = button.output_enabled[0];
-        button.output_2 = button.output_enabled[1];
     }
     true
 }
@@ -1125,7 +1134,7 @@ fn sanitize_config(cfg: &mut AppConfig) {
     cfg.serial.timeout = cfg.serial.timeout.clamp(1, 5000);
     clip_chars(&mut cfg.serial.port, MAX_NAME_CHARS);
     if cfg.work_devices.is_empty() {
-        cfg.work_devices = vec![cfg.work_device_1.clone(), cfg.work_device_2.clone()];
+        cfg.work_devices = vec!["None".to_string(), "None".to_string()];
     }
     cfg.work_devices.truncate(MAX_OUTPUT_DEVICES);
     while cfg.work_devices.len() < 2 {
@@ -1134,8 +1143,6 @@ fn sanitize_config(cfg: &mut AppConfig) {
     for device in &mut cfg.work_devices {
         clip_chars(device, MAX_NAME_CHARS);
     }
-    cfg.work_device_1 = cfg.work_devices[0].clone();
-    cfg.work_device_2 = cfg.work_devices[1].clone();
     clip_chars(&mut cfg.theme, MAX_NAME_CHARS);
     if !OSD_STYLES.contains(&cfg.osd_style.as_str()) {
         cfg.osd_style = default_osd_style();
@@ -1163,6 +1170,9 @@ fn sanitize_config(cfg: &mut AppConfig) {
         } else {
             b.dial_index = b.dial_index.min(dial_count - 1);
         }
+        if !ACTIONS.contains(&b.action.as_str()) {
+            b.action = "none".to_string();
+        }
         if !MEDIA_TOKENS.contains(&b.media_key.as_str()) {
             b.media_key = MEDIA_TOKENS[0].to_string();
         }
@@ -1176,15 +1186,13 @@ fn sanitize_config(cfg: &mut AppConfig) {
             b.output_process = "None".to_string();
         }
         if b.output_enabled.is_empty() {
-            b.output_enabled = vec![b.output_1, b.output_2];
+            b.output_enabled = vec![true; cfg.work_devices.len()];
         }
         b.output_enabled.truncate(cfg.work_devices.len());
         b.output_enabled.resize(cfg.work_devices.len(), true);
         if !b.output_enabled.iter().any(|enabled| *enabled) {
             b.output_enabled.fill(true);
         }
-        b.output_1 = b.output_enabled[0];
-        b.output_2 = b.output_enabled[1];
     }
 }
 
@@ -1212,6 +1220,70 @@ fn load_config(path: &Path) -> ConfigLoad {
         Err(e) => {
             log_error!("config: {} could not be parsed: {e}", path.display());
             ConfigLoad::Unreadable
+        }
+    }
+}
+
+fn migrate_config_file(path: &Path) {
+    let Ok(file) = File::open(path) else { return; };
+    let mut reader = BufReader::new(file.take(MAX_CONFIG_BYTES));
+    if let Ok(head) = reader.fill_buf() {
+        if head.starts_with(&[0xEF, 0xBB, 0xBF]) {
+            reader.consume(3);
+        }
+    }
+    let Ok(mut value) = serde_json::from_reader::<_, serde_json::Value>(reader) else { return; };
+    migrate_legacy_config(&mut value);
+    let Ok(mut cfg) = serde_json::from_value::<AppConfig>(value.clone()) else { return; };
+    sanitize_config(&mut cfg);
+    let canonical = serde_json::to_value(&cfg).unwrap_or_default();
+    if value != canonical {
+        if save_config(path, &cfg) {
+            log_info!("config: migrated {} to the current format", path.display());
+        } else {
+            log_error!("config: could not rewrite migrated file {}", path.display());
+        }
+    }
+}
+
+fn migrate_legacy_config(value: &mut serde_json::Value) {
+    let Some(config) = value.as_object_mut() else { return; };
+    let legacy_device_1 = config.remove("work_device_1");
+    let legacy_device_2 = config.remove("work_device_2");
+    let needs_devices = config
+        .get("work_devices")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::is_empty)
+        .unwrap_or(true);
+    if needs_devices && (legacy_device_1.is_some() || legacy_device_2.is_some()) {
+        config.insert(
+            "work_devices".to_string(),
+            serde_json::Value::Array(vec![
+                legacy_device_1.unwrap_or_else(|| serde_json::Value::String("None".to_string())),
+                legacy_device_2.unwrap_or_else(|| serde_json::Value::String("None".to_string())),
+            ]),
+        );
+    }
+
+    let output_count = config
+        .get("work_devices")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(2)
+        .max(2);
+    if let Some(buttons) = config.get_mut("buttons").and_then(serde_json::Value::as_array_mut) {
+        for button in buttons.iter_mut().filter_map(serde_json::Value::as_object_mut) {
+            let output_1 = button.remove("output_1");
+            let output_2 = button.remove("output_2");
+            if button.get("action").and_then(serde_json::Value::as_str) == Some("output")
+                && !button.contains_key("output_enabled")
+                && (output_1.is_some() || output_2.is_some())
+            {
+                let mut enabled = vec![serde_json::Value::Bool(true); output_count];
+                if let Some(value) = output_1 { enabled[0] = value; }
+                if let Some(value) = output_2 { enabled[1] = value; }
+                button.insert("output_enabled".to_string(), serde_json::Value::Array(enabled));
+            }
         }
     }
 }
@@ -4108,11 +4180,6 @@ impl RvciApp {
                                                             .changed()
                                                         {
                                                             self.cfg.buttons[i].output_enabled[output_index] = enabled;
-                                                            if output_index == 0 {
-                                                                self.cfg.buttons[i].output_1 = enabled;
-                                                            } else if output_index == 1 {
-                                                                self.cfg.buttons[i].output_2 = enabled;
-                                                            }
                                                         }
                                                     }
                                                 });
@@ -6510,6 +6577,7 @@ fn main() -> Result<()> {
 
     let path = get_config_path();
     log_info!("config: using {}", path.display());
+    migrate_config_file(&path);
 
     match load_config(&path) {
         ConfigLoad::Loaded(cfg) => {
@@ -6877,8 +6945,6 @@ mod tests {
             media_key: "bogus".into(),
             dial_index: 99,
             output_process: "None".into(),
-            output_1: true,
-            output_2: true,
             output_enabled: vec![],
         }]);
         sanitize_config(&mut cfg);
@@ -6941,8 +7007,6 @@ mod tests {
         let mut config = AppConfig::default();
         config.work_devices = vec!["Headphones".into(), "Monitor".into()];
         let button = ButtonConfig {
-            output_1: true,
-            output_2: false,
             output_enabled: vec![true, false],
             ..ButtonConfig::default()
         };
@@ -6973,8 +7037,6 @@ mod tests {
         let mut config = AppConfig::default();
         config.work_devices = vec!["Headphones".into(), "Monitor".into()];
         let button = ButtonConfig {
-            output_1: false,
-            output_2: false,
             output_enabled: vec![false, false],
             ..ButtonConfig::default()
         };
@@ -7008,19 +7070,52 @@ mod tests {
 
     #[test]
     fn legacy_two_output_config_migrates_into_the_device_list() {
-        let mut config = AppConfig::default();
-        config.work_devices.clear();
-        config.work_device_1 = "Speakers".into();
-        config.work_device_2 = "Headphones".into();
-        config.buttons.push(ButtonConfig {
-            output_1: true,
-            output_2: false,
-            ..ButtonConfig::default()
-        });
-
-        sanitize_config(&mut config);
+        let dir = std::env::temp_dir().join("rvci-test-legacy-migration");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("mapping.json");
+        std::fs::write(&path, br#"{
+            "serial":{"port":"COM3","baud":115200,"timeout":50},
+            "value_max":1024.0,"work_device_1":"Speakers","work_device_2":"Headphones",
+            "dials":[],"buttons":[{"action":"output","output_1":true,"output_2":false}]
+        }"#).unwrap();
+        migrate_config_file(&path);
+        let config = match load_config(&path) {
+            ConfigLoad::Loaded(config) => config,
+            _ => panic!("legacy config did not load"),
+        };
         assert_eq!(config.work_devices, vec!["Speakers", "Headphones"]);
         assert_eq!(config.buttons[0].output_enabled, vec![true, false]);
+
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(rewritten.get("work_device_1").is_none());
+        assert!(rewritten.get("work_device_2").is_none());
+        assert_eq!(rewritten["work_devices"], serde_json::json!(["Speakers", "Headphones"]));
+        assert_eq!(
+            rewritten["buttons"][0],
+            serde_json::json!({
+                "action": "output",
+                "output_process": "None",
+                "output_enabled": [true, false]
+            })
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn button_json_contains_only_the_selected_action_fields() {
+        let none = serde_json::to_value(ButtonConfig::default()).unwrap();
+        assert_eq!(none, serde_json::json!({"action": "none"}));
+
+        let media = ButtonConfig {
+            action: "media".into(),
+            media_key: "next".into(),
+            ..ButtonConfig::default()
+        };
+        assert_eq!(
+            serde_json::to_value(media).unwrap(),
+            serde_json::json!({"action": "media", "media_key": "next"})
+        );
     }
 
     #[test]
@@ -7031,8 +7126,6 @@ mod tests {
         sanitize_config(&mut config);
 
         assert_eq!(config.work_devices, vec!["A", "B", "C"]);
-        assert_eq!(config.work_device_1, "A");
-        assert_eq!(config.work_device_2, "B");
     }
 
     #[test]
@@ -7049,8 +7142,6 @@ mod tests {
         assert!(remove_configured_output(&mut config, 0));
         assert_eq!(config.work_devices, vec!["B", "C"]);
         assert_eq!(config.buttons[0].output_enabled, vec![false, true]);
-        assert!(!config.buttons[0].output_1);
-        assert!(config.buttons[0].output_2);
         assert!(!remove_configured_output(&mut config, 1), "the first two outputs are retained");
     }
 
