@@ -92,14 +92,11 @@ void updateSliderValues() {
 }
 
 void sendSliderValues() {
-  String builtString = "";
   for (int i = 0; i < NUM_SLIDERS; i++) {
-    builtString += String(analogSliderValues[i]);
-    if (i < NUM_SLIDERS - 1) {
-      builtString += "|";
-    }
+    if (i > 0) Serial.print("|");
+    Serial.print(analogSliderValues[i]);
   }
-  Serial.println(builtString);
+  Serial.println();
 }
 
 void updateButtons() {

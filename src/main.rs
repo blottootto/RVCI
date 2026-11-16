@@ -1379,10 +1379,19 @@ impl AudioController {
         Ok(device.Activate(CLSCTX_ALL, None)?)
     }
 
-    unsafe fn get_session_manager() -> Result<IAudioSessionManager2> {
+    unsafe fn get_session_managers() -> Result<Vec<IAudioSessionManager2>> {
         let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-        let device: IMMDevice = enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia)?;
-        Ok(device.Activate(CLSCTX_ALL, None)?)
+        let devices = enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?;
+        let count = devices.GetCount()?;
+        let mut managers = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            if let Ok(device) = devices.Item(index) {
+                if let Ok(manager) = device.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) {
+                    managers.push(manager);
+                }
+            }
+        }
+        Ok(managers)
     }
 
     unsafe fn get_endpoint_volume(device_name: &str, data_flow: EDataFlow) -> Result<IAudioEndpointVolume> {
@@ -2186,19 +2195,21 @@ impl SessionCache {
 
     unsafe fn appeared(&mut self) -> bool {
         let mut now: HashSet<String> = HashSet::new();
-        let Ok(mgr) = AudioController::get_session_manager() else { return false };
-        let Ok(enum_sess) = mgr.GetSessionEnumerator() else { return false };
-        let Ok(count) = enum_sess.GetCount() else { return false };
-        for s_idx in 0..count {
-            let Ok(sess) = enum_sess.GetSession(s_idx) else { continue };
-            let Ok(s2) = Interface::cast::<IAudioSessionControl2>(&sess) else { continue };
-            match s2.GetProcessId() {
-                Ok(pid) if pid != 0 => {}
-                _ => continue,
-            }
-            if let Ok(p) = s2.GetSessionInstanceIdentifier() {
-                now.insert(p.to_string().unwrap_or_default());
-                CoTaskMemFree(Some(p.as_ptr() as *const c_void));
+        let Ok(managers) = AudioController::get_session_managers() else { return false };
+        for manager in managers {
+            let Ok(enum_sess) = manager.GetSessionEnumerator() else { continue };
+            let Ok(count) = enum_sess.GetCount() else { continue };
+            for s_idx in 0..count {
+                let Ok(sess) = enum_sess.GetSession(s_idx) else { continue };
+                let Ok(s2) = Interface::cast::<IAudioSessionControl2>(&sess) else { continue };
+                match s2.GetProcessId() {
+                    Ok(pid) if pid != 0 => {}
+                    _ => continue,
+                }
+                if let Ok(p) = s2.GetSessionInstanceIdentifier() {
+                    now.insert(p.to_string().unwrap_or_default());
+                    CoTaskMemFree(Some(p.as_ptr() as *const c_void));
+                }
             }
         }
         let fresh = now.iter().any(|id| !self.seen.contains(id));
@@ -2213,17 +2224,19 @@ impl SessionCache {
     unsafe fn refresh(&mut self) {
         self.list.clear();
         self.fetched = Some(Instant::now());
-        if let Ok(mgr) = AudioController::get_session_manager() {
-            if let Ok(enum_sess) = mgr.GetSessionEnumerator() {
-                if let Ok(count) = enum_sess.GetCount() {
-                    for s_idx in 0..count {
-                        if let Ok(sess) = enum_sess.GetSession(s_idx) {
-                            if let Ok(s2) = Interface::cast::<IAudioSessionControl2>(&sess) {
-                                if let Ok(pid) = s2.GetProcessId() {
-                                    if pid == 0 { continue; }
-                                    if let Ok(vol) = Interface::cast::<ISimpleAudioVolume>(&sess) {
-                                        let name = AudioController::get_process_name(pid).to_lowercase();
-                                        self.list.push((name, vol));
+        if let Ok(managers) = AudioController::get_session_managers() {
+            for manager in managers {
+                if let Ok(enum_sess) = manager.GetSessionEnumerator() {
+                    if let Ok(count) = enum_sess.GetCount() {
+                        for s_idx in 0..count {
+                            if let Ok(sess) = enum_sess.GetSession(s_idx) {
+                                if let Ok(s2) = Interface::cast::<IAudioSessionControl2>(&sess) {
+                                    if let Ok(pid) = s2.GetProcessId() {
+                                        if pid == 0 { continue; }
+                                        if let Ok(vol) = Interface::cast::<ISimpleAudioVolume>(&sess) {
+                                            let name = AudioController::get_process_name(pid).to_lowercase();
+                                            self.list.push((name, vol));
+                                        }
                                     }
                                 }
                             }
@@ -2305,6 +2318,10 @@ fn run_serial_processing(
     ui.set_status(SerialStatus::Connected);
 
     let dial_count = config.dials.len();
+    let needs_session_tracking = config
+        .dials
+        .iter()
+        .any(|dial| matches!(dial.dial_type.as_str(), "process" | "all_others"));
     let mut reader = BufReader::with_capacity(1024, port);
     let mut raw_line: Vec<u8> = Vec::with_capacity(MAX_SERIAL_LINE as usize);
     let mut line_pending = false;
@@ -2332,14 +2349,7 @@ fn run_serial_processing(
     let mut last_value_line = String::new();
     let mut settle: u32 = 0;
 
-    let mut process_map: HashSet<String> = HashSet::new();
-    for dial in &config.dials {
-        if let Some(name) = &dial.process_name {
-            process_map.insert(strip_exe(name).to_lowercase());
-        }
-    }
-
-// 1. Extract and split multiple comma-separated targets per dial
+    // Extract and split multiple comma-separated targets per dial.
     let dial_targets: Vec<Vec<String>> = config
         .dials
         .iter()
@@ -2355,7 +2365,7 @@ fn run_serial_processing(
         })
         .collect();
 
-    // 2. Populate the global exclusion map for the "all_others" dial using the split targets
+    // Populate the exclusion map for the "all_others" dial using the split targets.
     let mut process_map: HashSet<String> = HashSet::new();
     for targets in &dial_targets {
         for target_name in targets {
@@ -2380,7 +2390,7 @@ fn run_serial_processing(
     let mut last_session_scan = Instant::now();
 
     loop {
-        if last_session_scan.elapsed() >= SESSION_SCAN_EVERY {
+        if needs_session_tracking && last_session_scan.elapsed() >= SESSION_SCAN_EVERY {
             last_session_scan = Instant::now();
             if unsafe { sessions.appeared() } {
                 log_debug!("audio: new audio session, applying the knob levels to it");
@@ -2566,6 +2576,9 @@ fn run_serial_processing(
                                         if let Some(label) = switch_selected_output(proc, &target) {
                                             output_toggle_state.insert(proc.to_string(), next_output);
                                             log_info!("input: button {} toggled {} to {}", id + 1, proc, target);
+                                            force_reapply(&mut last_applied, &mut settle);
+                                            system_volume = None;
+                                            sessions.fetched = None;
                                             if config.enable_osd {
                                                 let _ = osd_tx.send(OsdMsg::output(label));
                                             }
