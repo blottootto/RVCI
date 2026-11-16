@@ -1,4 +1,5 @@
 target/
 *.pdb
-
+.continue/
+.vscode/
 Screenshot *.png
