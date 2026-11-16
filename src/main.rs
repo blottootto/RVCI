@@ -4425,6 +4425,8 @@ impl RvciApp {
         self.github_link(ui);
         ui.add_space(10.0);
         ui.label(RichText::new("Made by TZey, modified by blottootto").font(regular(12.5)).color(text_faint()));
+        ui.add_space(8.0);
+        ui.label(RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).font(regular(12.5)).color(text_faint()));
     }
 
     fn github_link(&mut self, ui: &mut egui::Ui) {

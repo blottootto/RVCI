@@ -156,6 +156,6 @@ Windows keeps a handful of key combos to itself, so the **Keys** action can't to
 Everything else is fair game. Letters, numbers, F1 to F12, the arrow keys, the symbol keys and the usual **Ctrl / Shift / Alt** combos (**Ctrl + Shift + M** and friends) all record and fire just fine.
 
 ## Upcoming features and bugfixes
-- Currently none
+- Investigate the **Whole System** slider: it currently excludes Output 2. Decide whether it should control all configured outputs, then implement and verify the intended behavior.
 
 
