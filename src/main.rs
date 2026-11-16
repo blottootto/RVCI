@@ -870,6 +870,8 @@ impl Default for ButtonConfig {
     }
 }
 
+fn default_work_devices() -> Vec<String> { vec!["None".to_string(), "None".to_string()] } 
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 struct AppConfig {
     serial: SerialConfig,
@@ -1949,6 +1951,7 @@ impl UiLink {
 enum OsdKind {
     Level,
     Output,
+    Notice,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1966,6 +1969,10 @@ impl OsdMsg {
 
     fn output(label: String) -> Self {
         Self { kind: OsdKind::Output, label, level: 0.0, muted: false }
+    }
+
+    fn notice(label: String) -> Self {
+        Self { kind: OsdKind::Notice, label, level: 0.0, muted: false }
     }
 }
 
@@ -2231,6 +2238,7 @@ impl SessionCache {
 const MAX_SERIAL_LINE: u64 = 512;
 const BUTTON_MIN_GAP: Duration = Duration::from_millis(40);
 const SESSION_SCAN_EVERY: Duration = Duration::from_millis(250);
+const DEBUG_BUTTON_PRESS_OSD: bool = cfg!(debug_assertions);
 
 fn force_reapply(last_applied: &mut [f32], settle: &mut u32) {
     last_applied.iter_mut().for_each(|v| *v = -1.0);
@@ -2297,7 +2305,7 @@ fn run_serial_processing(
     ui.set_status(SerialStatus::Connected);
 
     let dial_count = config.dials.len();
-    let mut reader = BufReader::new(port);
+    let mut reader = BufReader::with_capacity(1024, port);
     let mut raw_line: Vec<u8> = Vec::with_capacity(MAX_SERIAL_LINE as usize);
     let mut line_pending = false;
     let mut discarding = false;
@@ -2495,6 +2503,10 @@ fn run_serial_processing(
                         }
                         button_states[id] = new_state;
                         let rising = !prev && new_state;
+
+                        if rising && config.enable_osd && DEBUG_BUTTON_PRESS_OSD {
+                            let _ = osd_tx.send(OsdMsg::notice(format!("Button {} pressed", id + 1)));
+                        }
 
                         let btn = &config.buttons[id];
                         match btn.action.as_str() {
@@ -4047,8 +4059,9 @@ impl RvciApp {
             let mut reorder: Option<(usize, usize)> = None;
             let len = self.cfg.buttons.len();
             let mut rows = Rows::new();
+            let mut row_rects = Vec::with_capacity(len);
             for i in 0..len {
-                rows.item(ui, |ui| {
+                let (_, row_rect) = rows.item_with_rect(ui, |ui| {
                     ui.push_id(("btn", i), |ui| {
                         ui.horizontal(|ui| {
                             let source_index = self.button_drag;
@@ -4060,12 +4073,6 @@ impl RvciApp {
                             );
                             if drag.drag_started() {
                                 self.button_drag = Some(i);
-                            }
-                            if let Some(from) = self.button_drag {
-                                if from != i && drag.hovered() && ui.input(|input| input.pointer.any_released()) {
-                                    reorder = Some((from, i));
-                                    self.button_drag = None;
-                                }
                             }
                             ui.add_space(2.0);
 
@@ -4216,6 +4223,7 @@ impl RvciApp {
                         });
                     });
                 });
+                row_rects.push(row_rect);
             }
             if let Some(from) = self.button_drag {
                 if let Some(pointer) = ui.ctx().pointer_hover_pos() {
@@ -4241,6 +4249,13 @@ impl RvciApp {
                 }
             }
             if ui.input(|input| input.pointer.any_released()) {
+                if let (Some(from), Some(pointer)) = (self.button_drag, ui.ctx().pointer_hover_pos()) {
+                    if let Some(to) = row_rects.iter().position(|rect| rect.contains(pointer)) {
+                        if from != to {
+                            reorder = Some((from, to));
+                        }
+                    }
+                }
                 self.button_drag = None;
             }
             if remove.is_none() {
@@ -4578,6 +4593,18 @@ impl Rows {
         self.first = false;
         row(ui, add)
     }
+
+    fn item_with_rect<R>(
+        &mut self,
+        ui: &mut egui::Ui,
+        add: impl FnOnce(&mut egui::Ui) -> R,
+    ) -> (R, egui::Rect) {
+        if !self.first {
+            hairline(ui);
+        }
+        self.first = false;
+        row_with_rect(ui, add)
+    }
 }
 
 fn hairline(ui: &mut egui::Ui) {
@@ -4591,16 +4618,20 @@ fn hairline(ui: &mut egui::Ui) {
 }
 
 fn row<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    row_with_rect(ui, add).0
+}
+
+fn row_with_rect<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> (R, egui::Rect) {
     let content_w = (ui.available_width() - ROW_PAD * 2.0).max(40.0);
-    egui::Frame::none()
+    let output = egui::Frame::none()
         .inner_margin(egui::Margin::symmetric(ROW_PAD, 9.0))
         .show(ui, |ui| {
             ui.set_width(content_w);
             ui.set_min_height(28.0);
             ui.spacing_mut().item_spacing.y = 8.0;
             add(ui)
-        })
-        .inner
+        });
+    (output.inner, output.response.rect)
 }
 
 fn group<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
@@ -6195,7 +6226,7 @@ mod osd {
                 }
                 kind = m.kind;
                 label = m.label;
-                if kind == OsdKind::Output {
+                if kind != OsdKind::Level {
                     target = shown;
                     muted = false;
                 } else {
@@ -6387,6 +6418,8 @@ mod osd {
         let total = (w * h) as usize;
         let rect = panel_rect(w, h, scale);
         let is_output = kind == OsdKind::Output;
+        let is_notice = kind == OsdKind::Notice;
+        let text_only = is_output || is_notice;
 
         let surface = std::slice::from_raw_parts_mut(canvas.surface.bits, total);
         surface.fill(bgr(s.panel));
@@ -6404,7 +6437,7 @@ mod osd {
             inner_l - 1.0
         };
 
-        if !is_output {
+        if !text_only {
             let track_bgr = bgr(s.track);
             let fill_bgr = bgr(s.fill);
             let y0 = (bar_t.floor() as i32).max(0);
@@ -6436,18 +6469,18 @@ mod osd {
         let title_rc = RECT {
             left: inner_l as i32,
             top: (rect.1 + 13.0 * scale) as i32,
-            right: if is_output { inner_r as i32 } else { (inner_r - 66.0 * scale) as i32 },
+            right: if text_only { inner_r as i32 } else { (inner_r - 66.0 * scale) as i32 },
             bottom: (rect.1 + 41.0 * scale) as i32,
         };
         let mut head_rc = title_rc;
-        let mut title = to_utf16(if is_output { "Output" } else { label });
+        let mut title = to_utf16(if is_output { "Output" } else if is_notice { "Button" } else { label });
         if !title.is_empty() {
             DrawTextW(gdc, &mut title, &mut head_rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         }
 
         SelectObject(gdc, fonts.value.into());
         let mut sub_top = h;
-        if is_output {
+        if text_only {
             sub_top = (rect.3 - 33.0 * scale) as i32;
             let mut name_rc = RECT {
                 left: inner_l as i32,
@@ -6481,7 +6514,7 @@ mod osd {
         }
         SelectObject(gdc, old_font);
 
-        let title_split = if is_output { w } else { title_rc.right.max(0) } as usize;
+        let title_split = if text_only { w } else { title_rc.right.max(0) } as usize;
         let ink = (s.ink.r() as f32, s.ink.g() as f32, s.ink.b() as f32);
         let sub = (s.sub.r() as f32, s.sub.g() as f32, s.sub.b() as f32);
         let border = (
@@ -7521,6 +7554,10 @@ mod tests {
         assert_eq!(msg.kind, OsdKind::Output);
         assert_eq!(msg.level, 0.0);
         assert!(!msg.muted, "an output switch is never a mute");
+
+        let notice = OsdMsg::notice("Button 1 pressed".to_string());
+        assert_eq!(notice.kind, OsdKind::Notice);
+        assert_eq!(notice.label, "Button 1 pressed");
 
         let vol = OsdMsg::level("Spotify".to_string(), 0.42, true);
         assert_eq!(vol.kind, OsdKind::Level);

@@ -4,14 +4,14 @@ void updateSliderValues();
 void sendSliderValues();
 void updateButtons();
 
-const int NUM_SLIDERS = 5;
-const int analogInputs[NUM_SLIDERS] = {A1, A2, A3, A4, A5};
+const int NUM_SLIDERS = 4;
+const int analogInputs[NUM_SLIDERS] = {A0, A1, A2, A3};
 
-const int NUM_BUTTONS = 5;
-const int buttonPins[NUM_BUTTONS] = {2, 3, 4, 5, 6};
+const int NUM_BUTTONS = 8;
+const int buttonPins[NUM_BUTTONS] = {2, 3, 4, 5, 6, 7, 8, 9};
 
-const int switchPin1 = 8;
-const int switchPin2 = 7;
+const int switchPin1 = 11; // was 8
+const int switchPin2 = 10; // was 7
 
 int analogSliderValues[NUM_SLIDERS];
 float smoothedValues[NUM_SLIDERS];
